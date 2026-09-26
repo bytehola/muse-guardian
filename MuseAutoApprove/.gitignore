@@ -1,0 +1,14 @@
+# 持久化数据（含凭据/会话，绝不要提交）
+data/cookies.json
+data/credentials.json
+data/muse-config.json
+data/token-last.json
+data/*.bak.*
+data/*.stop
+data/*.pid
+
+# 日志
+log/
+
+# 依赖
+node_modules/

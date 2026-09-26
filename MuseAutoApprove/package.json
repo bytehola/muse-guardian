@@ -1,0 +1,24 @@
+{
+  "name": "muse-auto-approve",
+  "version": "1.0.0",
+  "private": true,
+  "description": "muse.ai HITL egress-approval automation (reverse-engineered): auto-login + auto-approve (allow_always) + perpetual session, pure Node.",
+  "main": "muse-daemon.cjs",
+  "engines": {
+    "node": ">=20.18"
+  },
+  "scripts": {
+    "check": "node muse-daemon.cjs --check",
+    "start": "node muse-daemon.cjs --loop 10000 --always --fallback-once",
+    "once": "node muse-daemon.cjs --once",
+    "smoke": "node muse-daemon.cjs --smoke",
+    "login": "node work/login-lib.cjs",
+    "list": "node work/muse-rpc.cjs list"
+  },
+  "dependencies": {
+    "undici": "^7.30.0",
+    "ws": "^8.21.3",
+    "https-proxy-agent": "^7.0.6",
+    "sodium-native": "^5.1.0"
+  }
+}

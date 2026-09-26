@@ -1,0 +1,2920 @@
+---
+name: sandbox-keepalive-wechat
+description: "在全新沙盒/新账号上从零部署一套「CF Server Monitor 探针 + 三层保活 + Hermes 微信机器人 + MuseAutoApprove（muse.ai 外联审批自动批准）」：Cloudflare Worker 后台、cf-probe 探针、持久化脚本布局、离线包缓存、Hermes 安装与模型 API 配置、微信扫码绑定、沙盒内看门狗、平台定时巡检、平台开机钩子、端到端验证。走一步问一步；每步五段式（命令 / 话术 / 用户手动动作 / 做完的标志 / 排错表格）；全部脚本完整代码直接内嵌，复制即可用。触发词：部署保活、给新账号也来一套、装探针、微信机器人、沙盒重建恢复、保活脚本、自动审批、审批卡片、MuseAutoApprove。"
+version: 2.1.0
+license: MIT
+metadata:
+  hermes:
+    tags: [sandbox, keepalive, disaster-recovery, cloudflare, probe, hermes, weixin, deployment, muse-auto-approve]
+    related_skills: [weixin-instant-ack, sandbox-environment-recon]
+---
+
+# 沙盒保活 + Hermes 微信机器人：一键部署手册
+
+## 一、这套东西是什么
+
+平台（Muse / hatch 沙盒）会不定期**重建**沙盒：整机从外部删掉重装，沙盒内的一切——
+进程、systemd、cron、/tmp——全部消失，只有 `$HOME`（`/home/hatch`）会保留。
+
+本手册部署的是一套**三层保活 + 微信机器人**：
+
+| 层 | 组件 | 对付的故障 | 恢复时间 |
+|---|---|---|---|
+| 探针 | `cf-probe`（systemd 服务）→ CF Server Monitor 后台 | 你想知道机器到底活着还是挂了 | 60 秒上报一次 |
+| Layer 1 | `watchdog.sh`（沙盒内 cron，每分钟） | 机器活着，但某个进程挂了 / 微信连接卡死 | 1 分钟内 |
+| Layer 2a | 平台定时任务（每小时…不，每分钟，跑在沙盒外） | 整机被重建，沙盒内 cron 全灭 | 1 分钟内发现，约 2 分钟恢复 |
+| Layer 2b | 平台原生开机钩子（每次启动跑一次） | 同上，但更快（开机即恢复） | 开机后约 100 秒 |
+| Layer 3 | `restore-all.sh`（幂等一键恢复） | 被 1、2a、2b 调用 | 约 2 分钟 |
+| 审批自动化 | `MuseAutoApprove`（沙盒内 node 常驻，步骤 10–19） | 沙盒访问新域名时平台弹审批卡片、外联卡住 | 默认每 10 秒一轮询 |
+
+装完的效果：
+
+- 微信里能跟 Hermes 机器人对话（Hermes 是跑在沙盒里的 AI Agent，你自己的模型 API 供它思考）；
+- 服务器状态每 60 秒上报到 CF 后台，网页上能看到在线状态、CPU、内存、流量；
+- 沙盒被重建后**不用人工干预**：平台巡检/开机钩子会自动把 Hermes、探针、cron、sshd 全部拉回来。
+- （可选）**自动审批**：MuseAutoApprove 替你自动点"允许"，沙盒访问新域名不再弹卡片（步骤 10–19）。
+
+**没有任何一层能阻止平台重建沙盒**——重建是平台从外部做的。本体系只保证「重建后自动恢复」。
+
+## 二、怎么用这本手册（AI 必须遵守的行事规则）
+
+1. **走一步问一步。** 不要一次性列出所有条件、不要把后面的步骤提前做。每个步骤做完，停下来跟用户确认，再进下一步。用户明确要求过：「不需要前置条件清单，走一步问一步」。
+2. **每一步都是五段式**，固定顺序，缺一不可：
+   - **① AI 执行**：你（AI）要跑的命令，精确到可以直接复制。不要写"类似这样"，要写实际的命令。
+   - **② 对用户说**：可以**原样发给用户**的话术（可微调语气，不要改意思）。用户是技术型、直接、要求客观，话术要短、要具体、要说清"要他做什么"。
+   - **③ 用户手动做**：用户必须在网页/手机/平台端点的动作。
+   - **④ 做完的标志**：可验证的判据（命令 + 期望输出）。**做不到就不要往下走**，先解决问题。
+   - **⑤ 常见失败与处理**：表格，现象 → 原因 → 处理。
+3. **每条命令都要真跑过。** 报告结果时说清楚「跑了什么、看到什么」。跑不了就直说跑不了，不要编造输出。
+4. **密钥纪律（四条铁律，违反必出事）**：
+   - 真实 SECRET / API Key / Worker 域名 / API 地址**绝不写进任何文档、Skill、日志、记忆**——本手册里全用占位符：`<PROBE_ID>`、`<API_SECRET>`、`<WORKER_URL>`、`<API_BASE_URL>`、`<MODEL_NAME>`。
+   - 密钥优先**让用户自己生成**，通过**安全页面**发给你；只有用户明确同意时才由 AI 生成并在聊天里**一次性**显示。
+   - **先脱敏再打印**，不是"先打印再脱敏"。需要确认密钥存在，就只输出计数/长度/路径/布尔值，不输出值本身。
+   - 含密钥的文件（`install-cf-probe.sh`、`~/.hermes/.env`）权限一律 600，且**不要用文件读取工具打开**（内容会进会话历史）。
+5. **谁做什么**（重要，别硬揽）：
+   - 沙盒内的一切（跑脚本、装服务、写 cron、改文件）→ 任何有 shell 的 Agent 都能做。
+   - **Layer 2a（平台定时任务）和 Layer 2b（平台开机钩子）跑在沙盒外面**：只有**平台侧 Agent**（Muse）或**用户在平台端**才能创建。如果你是在沙盒里跑的 Agent，这两步要**请求用户/平台侧 Agent 执行**，并把现成的 job 定义与提示词交给他们（本手册第 8、9 步给了全文）。
+   - 涉及 root 权限的操作（装包、写 systemd、启动 sshd、给 `init.sh` 加执行位）→ 沙盒里通常是 root，直接做，但要在报告里说明改了哪些系统路径。
+6. **顺序不可乱。** 本手册的顺序是经过迭代确认的：先有监控后台（不然探针没地方上报）→ 装探针（用户说的"探针是第一步"指的是这一步要早做，因为它决定后面所有验证都看得见）→ 持久化布局 → 离线包 → Hermes + API → 微信 → Layer 1 → 平台授权 → Layer 2a → Layer 2b → 验证 → **审批自动化（MuseAutoApprove：安装 / 凭据 / 启动 / 保活 / 持久化 / 验证）**。
+
+## 三、开工前的两次探测（不是前置条件，是事实确认）
+
+这两条命令是给自己看的，**不要**把它们包装成"前置条件清单"去问用户：
+
+```bash
+# 探测 1：我是谁、在哪、有没有 systemd / root
+whoami; echo "HOME=$HOME"; id -u; ls -d "$HOME/workspace" 2>/dev/null || echo "no workspace dir"
+systemctl --version 2>/dev/null | head -1 || echo "no systemd"
+# 探测 2：能不能出去（GitHub / Cloudflare / 模型 API 端点）
+curl -sS -m 8 -o /dev/null -w 'github %{http_code}\n' https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh
+curl -sS -m 8 -o /dev/null -w 'cf     %{http_code}\n' https://api.cloudflare.com/client/v4
+```
+
+期望：`whoami` 是 root 或可用 sudo 的用户；`HOME` 指向可持久化的家目录；systemd 存在；两个 HTTP 码不是 000（000 = 连不上）。若 GitHub 不通，第 3 步的离线缓存就是**必需**的，不是可选项。
+
+## 四、版本与迁移说明（本手册与沙盒里现有脚本的差别）
+
+本手册内嵌的脚本是**修正版**，与 2026-09-26 部署在沙盒里的旧版有 4 处**行为差异**。在新沙盒部署时以本手册为准；在已有沙盒上套用时，注意这 4 处会改变行为：
+
+1. `backup-hermes.sh`：SQLite 热备失败时**不再回退裸 `cp`**，改为 **fail closed**（打印错误、退出 1、上一份好备份原样保留）。
+2. `restore-hermes.sh`：**健康时完全跳过 installer**（不再"每次都重跑 installer"）；只有真缺 hermes / 真缺数据时才**先安全停网关**再动手。这直接修掉了「installer 的 post-build maintenance 动 state.db → `StateDbReplacedError` → 微信全链路静默失败」。
+3. `install-cf-probe.sh`：`SETUP_DIR` 支持 `CF_PROBE_SETUP_DIR` 覆盖（修掉"经启动器安装时本地缓存路径变成 `/tmp`"的坑）；新增**本地二进制缓存兜底**。
+4. `watchdog.sh`：网关卡死时的精确 kill 真正生效了（`gateway.pid` 是 **JSON**，旧代码把它当裸数字 `cat`，那个分支从来命中不了）。
+5. **本版新增步骤 10–19（MuseAutoApprove，第十五~二十四章）**：沙盒里的 muse.ai 外联审批自动批准（自动登录 + allow_always + 会话保活 + 自愈）。它不新增常驻服务，而是对 `watchdog.sh` / `restore-all.sh` 各追加一段（见第 14 步 A/B）。
+
+## 五、步骤 0：部署 CF Server Monitor 后台（Cloudflare Workers）
+
+**目标**：把监控后台跑起来，拿到 Worker 域名。**耗时**：10–15 分钟（多数时间在等用户给 Token）。
+**失败影响**：后面所有探针上报都无处可去。
+
+> 上游事实（2026-09-26 核对 `github.com/huilang-me/CF-Server-Monitor` README 与 `wrangler.toml`、`package.json`）：
+> 官方支持三条部署路径——① Cloudflare Workers 连接 GitHub 仓库（推荐）、② GitHub Actions、③ 一键部署按钮；
+> 构建命令 `npm run build:frontend`，部署命令 `npx wrangler deploy`；
+> Worker 需要一个 **`API_SECRET`**（Cloudflare 的 Variables and Secrets），它同时是「Agent 上报密钥」和「后台初始登录密码」；
+> `wrangler.toml` 里已声明 D1 绑定 `DB`（库名 `server-monitor-db`）和 Durable Object `MetricsBroadcaster`（首次部署会自动创建 DO namespace）。
+
+### ① AI 执行（命令）
+
+**先问用户走哪条路**（话术见 ②）：路径 A 你全自动做，路径 B 用户在网页上点几下。
+
+**路径 A：AI 用 wrangler 全自动部署（需要用户的 Cloudflare API Token）**
+
+```bash
+# 1. Token 只放环境变量，绝不写文件（用户通过安全页面给你）
+export CLOUDFLARE_API_TOKEN='<用户提供的 Token>'
+npx wrangler --version || npm i -g wrangler        # 没有 wrangler 就装
+
+# 2. 取代码
+git clone https://github.com/huilang-me/CF-Server-Monitor /tmp/cf-server-monitor
+cd /tmp/cf-server-monitor
+
+# 3. 看 D1 库是否存在；不存在就建（wrangler.toml 里绑定名是 DB、库名是 server-monitor-db）
+npx wrangler d1 list || true
+npx wrangler d1 create server-monitor-db || true   # 已存在会报 already exists，忽略
+
+# 4. 构建前端 + 部署（缺了 build:frontend 会部署出一个没有前端的 Worker）
+npm run build:frontend
+npx wrangler deploy
+
+# 5. 设置 Worker 密钥（Agent 上报密钥 = 后台初始密码）；值从环境变量读，不进 shell 历史
+printf '%s' "$PROBE_API_SECRET" | npx wrangler secret put API_SECRET
+
+# 6. 立刻清理 Token
+unset CLOUDFLARE_API_TOKEN PROBE_API_SECRET
+```
+
+**路径 B：用户在网页上部署（更省事，推荐给不想把 Token 交出来的用户）**
+
+- 一键部署：打开 `https://deploy.workers.cloudflare.com/?url=https://github.com/huilang-me/CF-Server-Monitor`，确认 Build command 是 `npm run build:frontend`，把 `API_SECRET` 改成随机强密码（不要用默认值）；
+- 或：Fork 仓库 → Cloudflare Dashboard → Workers & Pages → 从 GitHub 仓库导入 → 构建命令 `npm run build:frontend`、部署命令 `npx wrangler deploy`；
+- 部署后在 Worker 的 **Settings → Variables and Secrets** 添加 `API_SECRET`（类型选 Secret），保存并等重新部署完成。
+
+### ② 对用户说（可原样发送）
+
+> 第一步先把监控后台部署起来。它跑在 Cloudflare Workers 上，你账号的免费额度就够。
+>
+> 有两条路，你挑一条：
+>
+> **A. 我来部署**：需要一个 Cloudflare API Token，用一次就丢，不写任何文件。拿 Token：
+> 1. 打开 https://dash.cloudflare.com/profile/api-tokens
+> 2. Create Token → 选 **Edit Cloudflare Workers** 模板
+> 3. Account Resources 选你的账号 → Continue → Create Token
+> 4. **通过安全页面发给我**（不要直接贴在聊天里）
+>
+> **B. 你在网页上点**：打开这个一键部署链接（我把链接发你），构建命令保持 `npm run build:frontend`，`API_SECRET` 换成随机强密码，部署完在 Worker 的 Variables and Secrets 里确认 `API_SECRET` 已保存。
+>
+> 另外要先定 **API_SECRET** 这个值（探针上报密钥，也是后台初始登录密码）。两种做法：
+> - **推荐**：你自己用密码管理器生成一串 32 位随机串（只含字母数字），通过安全页面给我；
+> - 或者我生成、在聊天里只显示一次——但这样它会进聊天记录，你介意就别选这个。
+>
+> 部署成功后 wrangler / 网页会给出 Worker 域名（形如 `https://cf-server-monitor.<你的子域>.workers.dev`），把它告诉我。
+
+### ③ 用户手动做
+
+- 选路径 A：创建 Token → 走安全页面发给你；选路径 B：在 Cloudflare 网页完成部署。
+- 自己生成或接收 `API_SECRET`。
+- 把 Worker 域名告诉你。
+
+### ④ 做完的标志
+
+```bash
+export WORKER_URL='https://cf-server-monitor.<你的子域>.workers.dev'   # 真实值只放环境变量
+curl -sS -m 10 -o /dev/null -w 'HTTP %{http_code}\n' "$WORKER_URL/"     # 期望 200（不是 404 / 1101）
+curl -sS -m 10 -o /dev/null -w 'admin HTTP %{http_code}\n' "$WORKER_URL/admin"  # 期望 200
+```
+
+另外要用户确认：浏览器打开 `$WORKER_URL/admin#/admin`，用 **用户名 `admin` + 密码 = `API_SECRET`** 能登录进后台。
+登录成功即视为这一步完成。**顺手提醒用户**：登录后立刻在后台把管理员用户名/密码改掉（后台密码可以和 `API_SECRET` 分离，但探针上报必须继续用 `API_SECRET`）。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `Authentication error` / `10000` | Token 权限不对或已撤销 | 让用户按上面的模板重建一个；确认账户资源选的是目标账号 |
+| 部署成功但页面 404 | 没跑 `npm run build:frontend`，`dist/` 不存在 | 补跑构建再 `npx wrangler deploy` |
+| 接口返回 `API_SECRET is required` | Worker 没读到环境变量 | 在 Variables and Secrets 里删掉旧值重新添加 `API_SECRET`，保存后等重新部署 |
+| `D1 database already exists` | 以前部署过 | 正常，复用即可（`npx wrangler d1 list` 确认库名是 `server-monitor-db`） |
+| 部署卡住不动 | 网络问题 | Ctrl+C 重试一次；仍失败让用户看 Cloudflare 账号状态 |
+| `wrangler` 报 DO namespace 未创建 | 首次部署 | 重新 `npx wrangler deploy` 一次（`wrangler.toml` 的 `[[migrations]]` 会在部署时建）|
+
+## 六、步骤 1：装 cf-probe 探针（第一步落地动作）
+
+**目标**：让沙盒每 60 秒向 CF 后台报一次心跳，后台能看到这台机器在线。**耗时**：5–10 分钟。
+**失败影响**：后台看不见机器；后面"重建后自动恢复"没有外部可观测的判据。
+
+> 上游事实（2026-09-26 核对 `github.com/huilang-me/cfsm-agent`）：
+> 安装器是 `install.sh`，安装后服务名固定 `cf-probe`；root 安装位置
+> 二进制 `/usr/local/bin/cf-probe`、配置 `/etc/config/cf-probe/config.conf`、日志 `journalctl -u cf-probe -f`；
+> 必填参数 `-id`（服务器 ID）、`-secret`（必须等于 Worker 的 `API_SECRET`）、`-url`（Worker 上报地址）；
+> **后台「添加服务器」可以生成带全套参数的安装命令**，官方建议直接用后台生成的命令。
+
+### ① AI 执行（命令）
+
+```bash
+# 0. 先建目录（探针脚本要落在这里，$HOME 下才不会被重建带走）
+mkdir -p ~/workspace/setup/logs
+
+# 1. 让用户在 CF 后台「添加服务器」，把生成的安装命令发你。它会带齐 -id / -secret / -url 等参数。
+#    形如： cf-probe install -id=<服务器ID> -secret=<API_SECRET> -url=https://<worker>/update -interval=60 ...
+
+# 2. 落盘安装脚本（代码见下，三个占位符替换成真实值），权限 600
+#    写完后先自检：不能有残留占位符
+grep -q '<PROBE_ID>\|<API_SECRET>\|<WORKER_URL>' ~/workspace/setup/install-cf-probe.sh \
+  && echo "ERROR: 占位符未替换" || echo "占位符已替换干净"
+chmod 600 ~/workspace/setup/install-cf-probe.sh
+
+# 3. 落盘启动器（完整代码见本节末尾「代码 2/13」；把那段代码原样写进文件，然后：）
+chmod +x ~/workspace/setup/run-probe-install.sh
+
+# 4. 用启动器安装（不要直接跑 install-cf-probe.sh）
+bash ~/workspace/setup/run-probe-install.sh; echo "rc=$?"
+tail -20 ~/workspace/setup/logs/probe-install.log
+
+# 5. 立刻缓存一份二进制（完整代码见本节末尾「代码 3/13」；写进文件后执行）
+chmod +x ~/workspace/setup/cache-cf-probe-bin.sh
+bash ~/workspace/setup/cache-cf-probe-bin.sh
+```
+
+**为什么必须走 `run-probe-install.sh`**：cf-probe 的 Go 安装器在安装时会按 cmdline 关键字清理旧进程，直接调用 `install-cf-probe.sh` 会导致**调用者自己的 shell 被误杀**（因为你的命令行里出现了那个关键字）。启动器的对策是：把安装脚本复制到**不含关键字的临时路径**、用 `setsid` 放进**独立会话**再跑。
+
+### ② 对用户说（可原样发送）
+
+> 现在装探针——它是整套系统的"眼睛"，每 60 秒给 CF 后台上报一次这台机器的状态。
+>
+> 请做两件事：
+> 1. 打开后台 `https://<worker域名>/admin#/admin`（用户名 `admin`，密码是你刚设的 `API_SECRET`），
+>    在「服务器管理」里**添加服务器**，名称可以填 `sandbox-main` 或你习惯的名字；
+> 2. 点「复制」拿安装命令（选对系统和版本），**整条命令贴给我**。
+>
+> 那条命令里会带 `-id=`、`-secret=`、`-url=` 这些参数，我把它写成安装脚本落到沙盒里。
+> 提示：这条命令里含你的密钥，贴给我的时候没关系（我会写进 600 权限的文件，不会写进任何文档或记忆）。
+
+### ③ 用户手动做
+
+- 在 CF 后台添加服务器，把生成的安装命令贴给你。
+- 等 60–90 秒后，回后台看这台服务器是否**在线**、有没有数据上报。
+
+### ④ 做完的标志
+
+```bash
+systemctl is-active cf-probe                       # 期望 active
+systemctl status cf-probe --no-pager | head -5
+journalctl -u cf-probe -n 5 --no-pager -o cat      # 期望看到 started / WSS connected
+ls -l /etc/config/cf-probe/config.conf             # 期望存在（root 安装路径）
+```
+
+判据：`active` + 日志里有连接成功行 + **用户确认后台里这台机器在线**（三个都满足才往下走）。
+注意日志里的域名属于用户资产，**不要**把它复制进任何文档。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 后台看不到服务器 | `-secret` 与 Worker 的 `API_SECRET` 不一致 | 让用户核对两处值是否完全相同（大小写、有无引号） |
+| 安装脚本报"占位符未替换" | 三个占位符有残留 | 重新替换后用 `grep -q '<PROBE_ID>\|…'` 自检 |
+| 安装成功但服务不 active | 系统没有 systemd 或权限不足 | `systemctl --version` 确认；非 root 环境用 `systemctl --user`（非 root 安装时二进制在 `~/.cf-probe/`） |
+| 安装过程中调用者 shell 被杀 | 直接跑了 `install-cf-probe.sh` | 改用 `bash ~/workspace/setup/run-probe-install.sh` |
+| 下载 install.sh 失败 | GitHub 不通 | 有本地缓存 `cf-probe-install.saved.sh` 会自动兜底；没有缓存就先在能上网的机器上抓一份带过去 |
+| 探针报了但一直离线 | `-url` 少了 `/update` 或域名错 | 对照后台生成的命令核对 `-url=` |
+| 绑定/上报都正常，但流量/CPU 是空的 | 采集间隔为 0（`-collect_interval=0` 表示不额外采样） | 这是默认值，需要更细数据再在后台改参数（探针会自动拉取） |
+
+### 代码 1/13：`install-cf-probe.sh`（含密钥，权限 600，模板含 3 个占位符）
+
+**目标路径**：`~/workspace/setup/install-cf-probe.sh`
+
+```bash
+#!/usr/bin/env bash
+# install-cf-probe.sh — 安装/重装 cf-probe 探针（幂等，可反复执行）。
+#
+# 【本文件含真实密钥，权限必须 600】
+#  - 不要提交到任何仓库、不要贴进聊天、不要复制到别处。
+#  - 部署时把三个占位符换成真实值：<PROBE_ID>、<API_SECRET>、<WORKER_URL>。
+#    换完必须自检一次：grep 不到占位符才算换干净。
+#  - 密钥只在这里（+ Cloudflare Worker 的 API_SECRET）落盘，不要再另存副本。
+#
+# 结构对照上游（huilang-me/cfsm-agent install.sh，2026-09-26 核对）：
+#  1. 优先下载最新安装器，失败时用本地缓存 cf-probe-install.saved.sh，
+#     下载成功顺手更新缓存——重建时网络不可靠，本地兜底是必须的。
+#  2. 安装命令走 `install -id=… -secret=… -url=<worker>/update …`（参数名与上游一致）。
+#  3. 额外加固（本 SKILL 增加，已实测可用）：
+#     a. SETUP_DIR 支持 CF_PROBE_SETUP_DIR 覆盖 —— 因为探针安装必须经
+#        run-probe-install.sh 启动器，而启动器会把脚本复制到 /tmp 运行，
+#        此时 dirname "$0" 会变成 /tmp，本地缓存就找错地方了。
+#     b. 安装器与本地二进制缓存双兜底：无网时可直接跑缓存的 cf-probe 二进制
+#        （releases/latest/download/cf-probe-linux-amd64，与安装器下载的同一个文件，
+#        已验证字节一致；该二进制支持 `install` 子命令）。
+set -euo pipefail
+
+SETUP_DIR="${CF_PROBE_SETUP_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+SAVED="$SETUP_DIR/cf-probe-install.saved.sh"
+LATEST="$SETUP_DIR/cf-probe-install.latest.sh"
+INSTALL_SRC='https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh'
+
+# ===== 部署时替换这三行 =====
+PROBE_ID='<PROBE_ID>'
+API_SECRET='<API_SECRET>'
+WORKER_URL='<WORKER_URL>'
+# ==========================
+
+# 可选：自定义网络质量测试节点（留空=用 agent 内置节点）。
+# CF 后台「添加服务器」生成的安装命令里会带这组参数，原样抄过来即可。
+CT_NODE=''
+CU_NODE=''
+CM_NODE=''
+
+# 本地二进制缓存（由 cache-cf-probe-bin.sh 生成；按当前架构命名）
+case "$(uname -m)" in
+  x86_64|amd64)   BIN_ARCH=amd64 ;;
+  aarch64|arm64)  BIN_ARCH=arm64 ;;
+  armv7*|armv8l)  BIN_ARCH=armv7 ;;
+  *)              BIN_ARCH=unsupported ;;
+esac
+BIN_CACHE="$SETUP_DIR/cf-probe-linux-${BIN_ARCH}"
+
+ARGS=(install "-id=${PROBE_ID}" "-secret=${API_SECRET}" "-url=${WORKER_URL}/update"
+      -collect_interval=0 -interval=60 -connection_mode=auto -ping_mode=tcp
+      -reset_day=1 -auto_update=0)
+[ -n "$CT_NODE" ] && ARGS+=("-ct=${CT_NODE}")
+[ -n "$CU_NODE" ] && ARGS+=("-cu=${CU_NODE}")
+[ -n "$CM_NODE" ] && ARGS+=("-cm=${CM_NODE}")
+
+# 占位符自检：没换干净就别装，免得装出个连不上后台的探针
+for v in "$PROBE_ID" "$API_SECRET" "$WORKER_URL"; do
+  case "$v" in
+    *'<'*'>'*)
+      echo "[error] 占位符未替换：$v" >&2
+      exit 1 ;;
+  esac
+done
+
+installer=""
+if curl -fsSL "$INSTALL_SRC" -o "$LATEST" 2>/dev/null && [ -s "$LATEST" ]; then
+  chmod 600 "$LATEST"
+  cp -f "$LATEST" "$SAVED"
+  chmod 600 "$SAVED"
+  installer="$LATEST"
+  echo "[info] 已下载上游安装器，并更新本地缓存 $SAVED"
+elif [ -f "$SAVED" ]; then
+  installer="$SAVED"
+  echo "[warn] 上游下载失败，使用本地缓存安装器 $SAVED" >&2
+else
+  echo "[warn] 上游下载失败且本地无缓存安装器，尝试二进制缓存" >&2
+fi
+
+if [ -n "$installer" ]; then
+  if sh "$installer" "${ARGS[@]}"; then
+    echo "OK: cf-probe 安装完成（安装器路径）"
+    exit 0
+  fi
+  echo "[warn] 安装器执行失败，回退到本地二进制缓存" >&2
+fi
+
+if [ -x "$BIN_CACHE" ]; then
+  if "$BIN_CACHE" "${ARGS[@]}"; then
+    echo "OK: cf-probe 安装完成（本地二进制缓存 $BIN_CACHE）"
+    exit 0
+  fi
+  echo "[error] 本地二进制缓存安装失败" >&2
+  exit 1
+fi
+
+echo "[error] 无法安装 cf-probe：网络不可达，且没有安装器/二进制缓存。" >&2
+echo "[error] 处理：联网后重跑本脚本，或先跑 cache-cf-probe-bin.sh 缓存二进制（该缓存每次部署都建议做一份）。" >&2
+exit 1
+```
+
+### 代码 2/13：`run-probe-install.sh`（安全启动器）
+
+**目标路径**：`~/workspace/setup/run-probe-install.sh`　**权限**：`chmod +x`
+
+```bash
+#!/usr/bin/env bash
+# run-probe-install.sh — 探针安装器的安全启动器。
+# 背景：cf-probe 的 Go 安装器在安装时会按 cmdline 关键字清理旧进程，
+# 直接跑 install-cf-probe.sh 会导致调用者自己的 shell 被误杀（cmdline 含 cf-probe）。
+# 对策：复制到无关键字临时路径 + setsid 独立会话运行，隔离两种误伤。
+#
+# 另一处坑（2026-09-26 复核发现并修掉）：install-cf-probe.sh 内部用
+# `dirname "$0"` 定位 setup 目录。脚本被复制到 /tmp 后 $0 是 /tmp 里的临时文件，
+# dirname 会变成 /tmp —— 本地缓存路径（cf-probe-install.saved.sh）就指错了地方，
+# 离线兜底会失败、缓存也永远更新不到真目录。所以这里显式把真目录传下去：
+# 启动器 export CF_PROBE_SETUP_DIR，安装脚本优先读它。
+set -uo pipefail
+
+SETUP_DIR="${CF_PROBE_SETUP_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+SRC="$SETUP_DIR/install-cf-probe.sh"
+LOG="$SETUP_DIR/logs/probe-install.log"
+mkdir -p "$SETUP_DIR/logs"
+
+TMP_RUN="$(mktemp /tmp/.sysinit-XXXXXXXX.sh)"
+cp "$SRC" "$TMP_RUN"
+chmod 600 "$TMP_RUN"
+
+# 独立会话（新进程组），安装器即使杀进程组也伤不到调用者
+export CF_PROBE_SETUP_DIR="$SETUP_DIR"
+setsid bash "$TMP_RUN" >"$LOG" 2>&1 < /dev/null &
+pid=$!
+if wait "$pid"; then
+  rc=0
+else
+  rc=$?
+fi
+rm -f "$TMP_RUN"
+exit "$rc"
+```
+
+### 代码 3/13：`cache-cf-probe-bin.sh`（二进制离线缓存，本版新增）
+
+**目标路径**：`~/workspace/setup/cache-cf-probe-bin.sh`　**权限**：`chmod +x`
+
+```bash
+#!/usr/bin/env bash
+# cache-cf-probe-bin.sh — 把 cf-probe 二进制缓存到本地，供重建后无网时离线安装。
+#
+# 为什么需要它：install-cf-probe.sh 只缓存了「安装脚本」，而安装脚本本身还要去
+# GitHub releases 下载 8MB 左右的二进制。网络不可达时（国内沙盒常见）这一步会失败，
+# 探针就装不上。把二进制也缓存一份到 $HOME（沙盒重建不丢），恢复时零下载。
+#
+# 已验证（2026-09-26）：该 URL 下回来的二进制与安装器装到 /usr/local/bin/cf-probe
+# 的文件字节完全一致（sha256 相同），且 `--help` 里能看到 `cf-probe install` 子命令。
+set -uo pipefail
+
+SETUP_DIR="${CF_PROBE_SETUP_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+case "$(uname -m)" in
+  x86_64|amd64)   ARCH=amd64 ;;
+  aarch64|arm64)  ARCH=arm64 ;;
+  armv7*|armv8l)  ARCH=armv7 ;;
+  *) echo "[error] 不支持的架构 $(uname -m)" >&2; exit 1 ;;
+esac
+
+URL="https://github.com/huilang-me/cfsm-agent/releases/latest/download/cf-probe-linux-${ARCH}"
+OUT="$SETUP_DIR/cf-probe-linux-${ARCH}"
+TMP="$OUT.tmp.$$"
+
+echo "[info] 下载 $URL"
+if ! curl -fL --connect-timeout 10 -m 300 -o "$TMP" "$URL"; then
+  rm -f "$TMP"
+  echo "[error] 下载失败，二进制缓存未更新" >&2
+  exit 1
+fi
+chmod 755 "$TMP"
+
+# 自检：能识别 install 子命令才算是个能用的探针二进制
+if ! timeout 10 "$TMP" --help 2>&1 | grep -q 'cf-probe install'; then
+  rm -f "$TMP"
+  echo "[error] 下载的文件不像 cf-probe 二进制（自检失败），已丢弃" >&2
+  exit 1
+fi
+
+mv -f "$TMP" "$OUT"
+sha256sum "$OUT" | awk '{print $1}' > "$OUT.sha256"
+echo "OK: 已缓存 $OUT ($(stat -c %s "$OUT") 字节)"
+echo "    sha256=$(cat "$OUT.sha256")"
+```
+
+## 七、步骤 2：持久化布局（把保活脚本全部落盘）
+
+**目标**：把 8 个保活脚本放到 `$HOME/workspace/setup/`，全部可执行、全部语法检查通过。**耗时**：10 分钟。
+**失败影响**：没有这些脚本，重建后无法自动恢复。
+
+> 关键认知（要跟用户讲清楚）：**重建后 `$HOME` 还在，系统目录全没了**。
+> - 还在：`~/workspace/`（脚本、离线包、备份）、`~/.hermes/`（Hermes 程序与数据）、`~/.local/bin/`（启动器）。
+> - 会丢：`/usr/local/bin/cf-probe`、`/etc/systemd/system/cf-probe.service`、`/etc/config/cf-probe/`、`/usr/sbin/sshd`、root 的 crontab、`/tmp` 下的一切。
+> 所以恢复脚本要做的事就是"把系统目录里的东西按需重装一次"。
+
+### ① AI 执行（命令）
+
+```bash
+mkdir -p ~/workspace/setup/deb-cache ~/workspace/setup/logs
+mkdir -p ~/workspace/backups/hermes-home ~/workspace/tools ~/.hermes/memories
+
+# 把下面 5 个脚本按路径落盘（代码见本节末尾），然后统一设置权限 + 语法检查
+chmod +x ~/workspace/setup/*.sh
+for f in ~/workspace/setup/*.sh; do bash -n "$f" && echo "OK  $f" || echo "FAIL $f"; done
+ls -l ~/workspace/setup/*.sh
+```
+
+### ② 对用户说（可原样发送）
+
+> 接下来装保活脚本。先跟你说清"什么会丢、什么不会丢"，以后沙盒被重建你就知道发生了什么：
+>
+> - **重建后还在**：`~/workspace/` 里的脚本和离线包、`~/.hermes/` 里的 Hermes 程序和数据、备份。
+> - **重建后会丢**：探针二进制、systemd 服务、ssh/cron 这些系统组件、root 的定时任务、`/tmp` 里的东西。
+>
+> 丢掉的那些不需要你操心——恢复脚本会把它们重新装回来。你什么都不用做，我继续。
+
+### ③ 用户手动做
+
+无（这一步全自动）。
+
+### ④ 做完的标志
+
+```bash
+for f in watchdog.sh health-check.sh restore-all.sh lib-pkgs.sh \
+         restore-hermes.sh backup-hermes.sh run-probe-install.sh; do
+  [ -x "$HOME/workspace/setup/$f" ] && echo "OK  $f" || echo "MISSING/NOT-EXEC $f"
+done
+bash -n ~/workspace/setup/restore-all.sh && echo "restore-all.sh 语法 OK"
+```
+
+判据：7 个脚本全部 `OK`，没有 `MISSING/NOT-EXEC`，语法检查无 FAIL。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `bash -n` 报 `missing ']'` | 脚本被复制时丢了空格（如 `[ -f "$deb"]`） | 重新从本手册复制；本手册的代码是校验过语法的 |
+| 脚本落盘后权限不对 | 用了 `cp` 但源文件不可执行 | `chmod +x ~/workspace/setup/*.sh` |
+| `logs/` 不存在导致看门狗报错 | 没建目录 | 看门狗自己会 `mkdir -p`，但仍建议先建好 |
+| Hermes 在 `$HOME=/root` 下运行 | 平台注入的 HOME 异常 | 三个脚本都有 HOME 加固（HOME 下找不到 setup 但 `/home/hatch` 有就纠正），保持这段不要删 |
+
+### 代码 4/13：`lib-pkgs.sh`（离线 deb 安装公共函数）
+
+**目标路径**：`~/workspace/setup/lib-pkgs.sh`　**权限**：`chmod +x`
+
+```bash
+#!/usr/bin/env bash
+# lib-pkgs.sh — 离线 deb 安装公共函数（被 watchdog.sh / restore-all.sh source）。
+# 策略：只安装缺失的包（避免降级镜像自带的新版本）；
+# dpkg 跑两遍，第二遍解决 pre-depends 顺序问题（如 cron 依赖 cron-daemon-common 先 configure）。
+
+# 等待 dpkg/apt 锁释放。重建刚完成时平台自己的包 reconciliaton 可能占着锁，
+# 直接 dpkg 会失败；最多等 10 分钟，每 15 秒检查一次（见 skill 避坑）。
+wait_for_dpkg_lock() {
+  local waited=0
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+     || fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
+    if [ "$waited" -ge 600 ]; then
+      return 1
+    fi
+    sleep 15
+    waited=$((waited + 15))
+  done
+  return 0
+}
+
+# install_offline_debs <deb-cache-dir> [log-file]
+# 返回 0 表示成功（或无需安装），非 0 表示失败。
+install_offline_debs() {
+  local cache_dir="$1" log_file="${2:-/dev/null}"
+  local missing="" deb pkg
+
+  for deb in "$cache_dir"/*.deb; do
+    [ -f "$deb" ] || continue
+    pkg="$(dpkg-deb -f "$deb" Package 2>/dev/null)"
+    if [ -n "$pkg" ] && ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+      missing="$missing $deb"
+    fi
+  done
+
+  if [ -z "$missing" ]; then
+    return 0
+  fi
+
+  if ! wait_for_dpkg_lock; then
+    echo "dpkg 锁等待超时" >>"$log_file"
+    return 1
+  fi
+
+  # shellcheck disable=SC2086
+  if DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold -i $missing >>"$log_file" 2>&1; then
+    return 0
+  fi
+  # 第一遍可能因 pre-depends 顺序失败：configure 已解包的包，再装一遍
+  dpkg --configure -a >>"$log_file" 2>&1 || true
+  # shellcheck disable=SC2086
+  if DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold -i $missing >>"$log_file" 2>&1; then
+    dpkg --configure -a >>"$log_file" 2>&1 || true
+    return 0
+  fi
+  dpkg --configure -a >>"$log_file" 2>&1 || true
+  return 1
+}
+```
+
+### 代码 5/13：`watchdog.sh`（Layer 1 沙盒内看门狗）
+
+**目标路径**：`~/workspace/setup/watchdog.sh`　**权限**：`chmod +x`
+
+```bash
+#!/usr/bin/env bash
+# watchdog.sh — 每 1 分钟巡检：cf-probe 探针 / hermes 微信网关 / sshd。
+# 挂了就地修复；修不好写日志。设计遵循 awesome-skills/muse-reverse-ssh：
+# 原子 mkdir 单实例锁（不用 flock，避免 fd 被子进程继承导致锁死）、
+# pgrep 中括号技巧（避免匹配到检查进程自身）、/proc cmdline 校验。
+set -uo pipefail
+
+# HOME 加固：若当前 HOME 下找不到 setup 目录但 /home/hatch 下有，
+# 说明运行环境异常（如 HOME=/root），纠正后再继续（见 skill 避坑）
+if [ ! -d "$HOME/workspace/setup" ] && [ -d /home/hatch/workspace/setup ]; then
+  export HOME=/home/hatch
+fi
+
+SETUP_DIR="$HOME/workspace/setup"
+LOG="$SETUP_DIR/logs/watchdog.log"
+LOCKDIR="$SETUP_DIR/.watchdog.lock"
+
+# shellcheck disable=SC1091
+. "$SETUP_DIR/lib-pkgs.sh" 2>/dev/null || true
+
+export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+# --- 单实例锁（原子 mkdir；目录不会被子进程继承） ---
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  if [ -f "$LOCKDIR/pid" ]; then
+    oldpid=$(cat "$LOCKDIR/pid" 2>/dev/null || true)
+    if [ -n "$oldpid" ] && [ -f "/proc/$oldpid/cmdline" ] \
+       && tr '\0' ' ' < "/proc/$oldpid/cmdline" 2>/dev/null | grep -q "[/]watchdog.sh"; then
+      exit 0  # 另一个实例还活着，静默退出
+    fi
+  fi
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || exit 0  # 抢锁失败就退出
+fi
+echo $$ > "$LOCKDIR/pid"
+trap 'rm -rf "$LOCKDIR"' EXIT
+
+mkdir -p "$SETUP_DIR/logs"
+
+# --- 1. cf-probe 探针 ---
+if [ -f /etc/systemd/system/cf-probe.service ]; then
+  if ! systemctl is-active -q cf-probe 2>/dev/null; then
+    log "cf-probe 未运行，尝试 systemctl restart"
+    if systemctl restart cf-probe >>"$LOG" 2>&1; then
+      log "cf-probe 重启成功"
+    else
+      log "cf-probe 重启失败"
+    fi
+  fi
+else
+  log "cf-probe 服务文件丢失，执行重装"
+  if bash "$SETUP_DIR/run-probe-install.sh" >>"$LOG" 2>&1; then
+    log "cf-probe 重装成功"
+  else
+    log "cf-probe 重装失败"
+  fi
+fi
+
+# --- 2a. hermes 微信网关：进程活着但连接卡死 ---
+# 对应 skill 的 "A live tunnel process does not mean a live tunnel"：
+# 只查进程查不出微信 poll 卡死，看日志里 poll error 是否持续超过 5 分钟。
+WXLOG="$HOME/.hermes/logs/weixin-gateway.log"
+WX_RESTART_TS="$SETUP_DIR/.wx-wedged-restart-ts"
+if pgrep -f "[g]ateway run" >/dev/null 2>&1 && [ -f "$WXLOG" ]; then
+  since="$(date -d '10 minutes ago' '+%F %T')"
+  mapfile -t wxerrs < <(awk -v since="$since" \
+    'index($0,"poll error")>0 && substr($0,1,19)>=since {print substr($0,1,19)}' "$WXLOG" 2>/dev/null)
+  if [ "${#wxerrs[@]}" -ge 3 ]; then
+    first_ts="${wxerrs[0]}"; last_ts="${wxerrs[$((${#wxerrs[@]}-1))]}"
+    if [ "$(date -d "$last_ts" +%s)" -gt "$(( $(date -d "$first_ts" +%s) + 300 ))" ]; then
+      # 15 分钟内只因卡死重启一次，避免全网故障时反复重启
+      now="$(date +%s)"; last_restart=0
+      [ -f "$WX_RESTART_TS" ] && last_restart="$(cat "$WX_RESTART_TS" 2>/dev/null || echo 0)"
+      if [ "$((now - last_restart))" -ge 900 ]; then
+        log "微信 poll 持续报错超过 5 分钟（$first_ts ~ $last_ts），判定连接卡死，重启网关"
+        # 精确 kill：优先 gateway.pid。注意该文件是 JSON（{"pid":123,"kind":"hermes-gateway",...}），
+        # 不能直接 cat 当数字用；解析出 pid 后还要校验 /proc/<pid>/cmdline 命中 `gateway run`。
+        # 拿不到有效 pid 才枚举 pgrep 命中进程，并排除自身与父进程——
+        # 不用 `pkill -f`：一行命令里出现过 `gateway run` 字样（比如包装它的 bash -c）也会被误杀。
+        killed=0
+        gpid=""
+        if [ -f "$HOME/.hermes/gateway.pid" ]; then
+          if command -v jq >/dev/null 2>&1; then
+            gpid="$(jq -r '.pid // empty' "$HOME/.hermes/gateway.pid" 2>/dev/null || true)"
+          fi
+          if [ -z "$gpid" ]; then
+            gpid="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("pid",""))' \
+              "$HOME/.hermes/gateway.pid" 2>/dev/null || true)"
+          fi
+          if [ -n "$gpid" ] && [ -f "/proc/$gpid/cmdline" ] \
+             && tr '\0' ' ' < "/proc/$gpid/cmdline" 2>/dev/null | grep -q "[g]ateway run"; then
+            kill -TERM "$gpid" 2>/dev/null && killed=1
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              kill -0 "$gpid" 2>/dev/null || break
+              sleep 1
+            done
+            if kill -0 "$gpid" 2>/dev/null; then
+              kill -KILL "$gpid" 2>/dev/null || true
+              sleep 1
+            fi
+          fi
+        fi
+        if [ "$killed" = 0 ]; then
+          for p in $(pgrep -f "[g]ateway run" 2>/dev/null); do
+            [ "$p" = "$$" ] && continue
+            [ "$p" = "$PPID" ] && continue
+            kill -TERM "$p" 2>/dev/null || true
+          done
+        fi
+        echo "$now" > "$WX_RESTART_TS"
+        sleep 3
+      else
+        log "微信 poll 持续报错，但 15 分钟内已重启过，跳过"
+      fi
+    fi
+  fi
+  unset wxerrs
+fi
+
+# --- 2b. hermes 微信网关：进程缺失则重启 ---
+# 进程行是 bash -c 包装器 "... && hermes gateway run > log 2>&1"，用 [g] 避免自匹配
+if ! pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+  log "hermes gateway 进程丢失，尝试重启"
+  if compgen -G "$HOME/.hermes/weixin/accounts/*.json" > /dev/null 2>&1; then
+    mkdir -p "$HOME/.hermes/logs"
+    nohup hermes gateway run >> "$HOME/.hermes/logs/weixin-gateway.log" 2>&1 &
+    sleep 3
+    if pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+      log "hermes gateway 重启成功"
+    else
+      log "hermes gateway 重启后仍无进程"
+    fi
+  else
+    log "无微信账号凭据，跳过网关重启"
+  fi
+fi
+
+# --- 3. sshd ---
+if [ ! -x /usr/sbin/sshd ]; then
+  log "sshd 二进制丢失，尝试从离线缓存重装"
+  if install_offline_debs "$SETUP_DIR/deb-cache" "$LOG" && [ -x /usr/sbin/sshd ]; then
+    log "openssh-server 离线重装成功"
+  else
+    log "离线重装失败，回退到 apt"
+    apt-get install -y openssh-server >>"$LOG" 2>&1 || log "openssh-server 安装失败"
+  fi
+fi
+if [ -x /usr/sbin/sshd ]; then
+  mkdir -p /run/sshd
+  chown root:root /run/sshd; chmod 755 /run/sshd
+  [ -f /etc/ssh/ssh_host_rsa_key ] || ssh-keygen -A >>"$LOG" 2>&1
+  if ! pgrep -f "[/]usr/sbin/sshd" >/dev/null 2>&1; then
+    log "sshd 未运行，尝试启动"
+    if /usr/sbin/sshd >>"$LOG" 2>&1; then
+      # 刚启动完立即检查在负载高时可能误判，重试 3 次 × 2 秒（见 skill 避坑）
+      ok=0
+      for i in 1 2 3; do
+        sleep 2
+        if pgrep -f "[/]usr/sbin/sshd" >/dev/null 2>&1; then ok=1; break; fi
+      done
+      [ "$ok" = 1 ] && log "sshd 启动成功" || log "sshd 启动后仍无进程（3 次重试）"
+    else
+      log "sshd 启动失败"
+    fi
+  fi
+else
+  log "sshd 二进制仍缺失，本次跳过"
+fi
+
+log "巡检完成"
+```
+
+### 代码 6/13：`health-check.sh`（健康检查，0=健康 / 1=需恢复）
+
+**目标路径**：`~/workspace/setup/health-check.sh`　**权限**：`chmod +x`
+
+```bash
+#!/usr/bin/env bash
+# health-check.sh — 沙盒健康检查，供平台级定时任务调用。
+# 退出码：0=健康；1=需要恢复（疑似重建或关键服务全挂）；2=环境异常（无法判断）。
+#
+# 检查项（与 watchdog.sh / restore-all.sh 保持一致）：
+#   1. cf-probe systemd 服务 active
+#   2. hermes 微信网关进程存活
+#   3. sshd 进程存活
+#   4. cron 进程存活 且 crontab 里有看门狗
+
+# HOME 加固：若当前 HOME 下找不到 setup 目录但 /home/hatch 下有，
+# 说明运行环境异常（如 HOME=/root），纠正后再继续（见 skill 避坑）
+if [ ! -d "$HOME/workspace/setup" ] && [ -d /home/hatch/workspace/setup ]; then
+  export HOME=/home/hatch
+fi
+
+SETUP_DIR="$HOME/workspace/setup"
+failures=""
+
+if [ "$(systemctl is-active cf-probe 2>/dev/null)" != "active" ]; then
+  failures="$failures cf-probe"
+fi
+if ! pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+  failures="$failures hermes-gateway"
+fi
+if ! pgrep -f "[/]usr/sbin/sshd" >/dev/null 2>&1; then
+  failures="$failures sshd"
+fi
+if ! pgrep -f "[/]usr/sbin/cron" >/dev/null 2>&1; then
+  failures="$failures cron-daemon"
+fi
+if ! crontab -l 2>/dev/null | grep -q "watchdog.sh"; then
+  failures="$failures cron-entry"
+fi
+
+if [ -z "$failures" ]; then
+  echo "OK: all services healthy"
+  exit 0
+fi
+
+# 区分"重建"还是"普通故障"：/usr 关键二进制都没了 => 重建
+if [ ! -x /usr/bin/crontab ] || [ ! -x /usr/sbin/sshd ] || [ ! -f /usr/local/bin/cf-probe ]; then
+  echo "REBUILD_DETECTED: missing base binaries; failed:$failures"
+  exit 1
+fi
+
+echo "DEGRADED: failed:$failures"
+exit 1
+```
+
+### 代码 7/13：`restore-all.sh`（Layer 3 一键恢复，幂等）
+
+**目标路径**：`~/workspace/setup/restore-all.sh`　**权限**：`chmod +x`
+
+```bash
+#!/usr/bin/env bash
+# restore-all.sh — 沙盒重建后一键恢复（幂等，可重复执行）：
+#   基础包(cron/openssh, 优先离线缓存) → hermes → cf-probe → cron定时任务 → sshd → 看门狗
+# 锁：脚本内部原子 mkdir（不用外层 flock，避免 fd 被拉起的守护进程继承导致后续恢复被跳过）。
+set -uo pipefail
+
+# HOME 加固：若当前 HOME 下找不到 setup 目录但 /home/hatch 下有，
+# 说明运行环境异常（如 HOME=/root），纠正后再继续（见 skill 避坑）
+if [ ! -d "$HOME/workspace/setup" ] && [ -d /home/hatch/workspace/setup ]; then
+  export HOME=/home/hatch
+fi
+
+SETUP_DIR="$HOME/workspace/setup"
+LOG="$SETUP_DIR/logs/restore.log"
+LOCKDIR="$SETUP_DIR/.restore.lock"
+MAX_RESTORE_SEC=1200  # 20 分钟：超时视为 stale 锁
+
+# shellcheck disable=SC1091
+. "$SETUP_DIR/lib-pkgs.sh"
+
+export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export DEBIAN_FRONTEND=noninteractive
+
+mkdir -p "$SETUP_DIR/logs"
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+# --- 单实例锁（带超时的 stale 回收；恢复是限时操作，年龄规则可用） ---
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  if [ -f "$LOCKDIR/pid" ] && [ -f "$LOCKDIR/started" ]; then
+    oldpid=$(cat "$LOCKDIR/pid" 2>/dev/null || true)
+    started=$(cat "$LOCKDIR/started" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    alive=0
+    if [ -n "$oldpid" ] && [ -f "/proc/$oldpid/cmdline" ] \
+       && tr '\0' ' ' < "/proc/$oldpid/cmdline" 2>/dev/null | grep -q "[/]restore-all.sh"; then
+      alive=1
+    fi
+    if [ "$alive" = 1 ] && [ $((now - started)) -lt "$MAX_RESTORE_SEC" ]; then
+      log "已有恢复在进行中，本次退出"
+      exit 0
+    fi
+    log "检测到 stale 锁（pid=$oldpid），回收后继续"
+  fi
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || { log "抢锁失败，退出"; exit 0; }
+fi
+echo $$ > "$LOCKDIR/pid"
+date +%s > "$LOCKDIR/started"
+trap 'rm -rf "$LOCKDIR"' EXIT
+
+log "===== 开始恢复 ====="
+
+# --- 0. 等 apt/dpkg 锁（重建后平台可能在做包 reconciling，最多等 10 分钟） ---
+for i in $(seq 1 20); do
+  if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+     && ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+    break
+  fi
+  log "apt/dpkg 锁被占用，等待 30s ($i/20)"
+  sleep 30
+done
+
+# --- 1. 基础包：cron（定时任务）、openssh-server（sshd） ---
+need_pkgs=0
+[ -x /usr/bin/crontab ] || need_pkgs=1
+[ -x /usr/sbin/sshd ]   || need_pkgs=1
+if [ "$need_pkgs" = 1 ]; then
+  log "安装基础包（优先离线缓存）"
+  if install_offline_debs "$SETUP_DIR/deb-cache" "$LOG" \
+     && [ -x /usr/bin/crontab ] && [ -x /usr/sbin/sshd ]; then
+    log "离线缓存安装成功"
+  else
+    log "离线缓存不可用/不完整，回退 apt（可能较慢）"
+    apt-get update -qq >>"$LOG" 2>&1
+    apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+      cron openssh-server >>"$LOG" 2>&1 || log "WARN: apt 安装基础包失败"
+  fi
+else
+  log "基础包已存在，跳过"
+fi
+
+# --- 2. hermes（现有脚本，幂等：重装 + 恢复用户数据 + 重启网关） ---
+log "恢复 hermes"
+bash "$SETUP_DIR/restore-hermes.sh" >>"$LOG" 2>&1 && log "hermes 恢复完成" || log "WARN: hermes 恢复失败"
+
+# --- 3. cf-probe 探针（安装脚本幂等） ---
+log "安装 cf-probe"
+bash "$SETUP_DIR/run-probe-install.sh" >>"$LOG" 2>&1 && log "cf-probe 安装完成" || log "WARN: cf-probe 安装失败"
+
+# --- 4. cron 定时任务：看门狗每 1 分钟（仓库推荐 1 分钟一轮询） ---
+if [ -x /usr/bin/crontab ]; then
+  (crontab -l 2>/dev/null | grep -v "watchdog.sh"; echo "* * * * * $SETUP_DIR/watchdog.sh") | crontab -
+  log "cron 定时任务已写入"
+  # 确保 cron 守护进程在跑
+  if ! pgrep -f "[/]usr/sbin/cron" >/dev/null 2>&1; then
+    (service cron start >>"$LOG" 2>&1 || /usr/sbin/cron >>"$LOG" 2>&1) && log "cron 守护进程已启动" || log "WARN: cron 守护进程启动失败"
+  fi
+else
+  log "WARN: crontab 不可用，定时任务未写入"
+fi
+
+# --- 5. sshd ---
+if [ -x /usr/sbin/sshd ]; then
+  mkdir -p /run/sshd
+  chown root:root /run/sshd; chmod 755 /run/sshd
+  [ -f /etc/ssh/ssh_host_rsa_key ] || ssh-keygen -A >>"$LOG" 2>&1
+  if ! pgrep -f "[/]usr/sbin/sshd" >/dev/null 2>&1; then
+    /usr/sbin/sshd >>"$LOG" 2>&1 && log "sshd 已启动" || log "WARN: sshd 启动失败"
+  else
+    log "sshd 已在运行"
+  fi
+else
+  log "WARN: sshd 二进制缺失"
+fi
+
+# --- 6. 立刻跑一次看门狗做最终校验 ---
+log "运行看门狗做最终校验"
+bash "$SETUP_DIR/watchdog.sh" >>"$LOG" 2>&1
+
+log "===== 恢复结束 ====="
+echo "OK: 恢复流程结束，详见 $LOG"
+```
+
+### 代码 8/13：`restore-hermes.sh`（Hermes 恢复：健康就什么都不做）
+
+**目标路径**：`~/workspace/setup/restore-hermes.sh`　**权限**：`chmod +x`
+
+```bash
+#!/usr/bin/env bash
+# restore-hermes.sh — 沙盒重建后恢复 Hermes Agent（幂等，可反复跑）。
+#
+# 原理：Hermes 的一切都在 $HOME 下（~/.hermes 程序+数据、~/.local/bin 启动器），
+# 沙盒重建只丢系统目录，所以通常只需重跑一次安装脚本即可恢复。
+#
+# 三条硬规则（2026-09-26 实测踩过，违反必然导致微信全链路静默失败）：
+#  1. 健康时【完全跳过 installer】。installer 的 post-build maintenance 会动
+#     ~/.hermes/state.db；网关正在运行、句柄在 state.db 上时被换掉文件，
+#     网关会抛 StateDbReplacedError 并拒绝一切写入（=所有微信回复失败）。
+#     所以：hermes 可用 且 数据完好 → 什么都不做，只确保网关在跑。
+#  2. 真正要动东西（缺 hermes / 缺数据）时，先【安全停网关】再动手，做完重新启动。
+#     停网关优先用 gateway.pid 里的 pid（该文件是 JSON，不是裸数字），
+#     校验 /proc/<pid>/cmdline 命中 `gateway run` 才 kill；拿不到就枚举
+#     pgrep 命中的进程（排除自身与父进程），绝不用 `pkill -f` 一把梭。
+#  3. 账号判断必须用 `compgen -G`：`[ -f dir/*.json ]` 在匹配到多个文件时
+#     报 "too many arguments" 恒为假，症状就是"重建后网关起不来"。
+#
+# 退出码：0=一切就绪；1=有步骤失败（日志里能看到是哪一步）。
+set -uo pipefail
+
+# 允许测试夹具覆盖（生产不设此变量，走 $HOME/workspace/setup）
+SETUP_DIR="${HERMES_SETUP_DIR:-$HOME/workspace/setup}"
+SAVED="$SETUP_DIR/hermes-install.sh"
+LATEST="$SETUP_DIR/hermes-install.latest.sh"
+BACKUP="$HOME/workspace/backups/hermes-home"
+INSTALL_URL="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
+GWLOG="$HOME/.hermes/logs/weixin-gateway.log"
+
+export PATH="$HOME/.local/bin:$PATH"
+
+log() { echo "[restore-hermes] $*"; }
+rc=0
+
+# --- 读 gateway.pid（JSON 格式：{"pid": 12345, "kind": "hermes-gateway", ...}） ---
+gateway_pid() {
+  local f="$HOME/.hermes/gateway.pid" p=""
+  [ -f "$f" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    p="$(jq -r '.pid // empty' "$f" 2>/dev/null || true)"
+  fi
+  if [ -z "$p" ]; then
+    p="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("pid",""))' "$f" 2>/dev/null || true)"
+  fi
+  [ -n "$p" ] && printf '%s' "$p"
+  return 0
+}
+
+# --- 停网关：只杀真的是网关的进程 ---
+stop_gateway() {
+  local pid mypid ppid_ pids p waited ok
+  mypid=$$
+  ppid_="$PPID"
+  pid="$(gateway_pid)"
+  if [ -n "$pid" ] && [ -f "/proc/$pid/cmdline" ] \
+     && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "[g]ateway run"; then
+    log "按 gateway.pid 精确停网关 pid=$pid"
+    kill -TERM "$pid" 2>/dev/null || true
+    waited=0
+    while [ "$waited" -lt 30 ]; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1; waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      log "WARN 网关 ${waited}s 未退出，SIGKILL pid=$pid"
+      kill -KILL "$pid" 2>/dev/null || true
+      sleep 2
+    fi
+    kill -0 "$pid" 2>/dev/null && { log "ERROR 网关仍在运行"; return 1; }
+    log "网关已停止"
+    return 0
+  fi
+  # pidfile 不可用：枚举命中进程（排除自身和父进程，避免误杀调用者）
+  pids=""
+  for p in $(pgrep -f "[g]ateway run" 2>/dev/null || true); do
+    [ "$p" = "$mypid" ] && continue
+    [ "$p" = "$ppid_" ] && continue
+    pids="$pids $p"
+  done
+  [ -n "$pids" ] || { log "网关未在运行，无需停"; return 0; }
+  log "pidfile 不可用，按 pgrep 命中停止:$pids"
+  # shellcheck disable=SC2086
+  kill -TERM $pids 2>/dev/null || true
+  waited=0; ok=0
+  while [ "$waited" -lt 30 ]; do
+    ok=1
+    for p in $pids; do
+      kill -0 "$p" 2>/dev/null && ok=0
+    done
+    [ "$ok" = 1 ] && break
+    sleep 1; waited=$((waited + 1))
+  done
+  if [ "$ok" = 0 ]; then
+    log "WARN 仍有网关进程未退出，SIGKILL 剩余进程"
+    for p in $pids; do kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true; done
+    sleep 2
+  fi
+  for p in $pids; do
+    kill -0 "$p" 2>/dev/null && { log "ERROR 网关进程 $p 仍在运行"; return 1; }
+  done
+  log "网关已停止"
+  return 0
+}
+
+# --- 启动网关：没在跑才启动（避免双实例） ---
+start_gateway_if_needed() {
+  if pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+    log "微信网关已在运行，无需启动"
+    return 0
+  fi
+  if compgen -G "$HOME/.hermes/weixin/accounts/*.json" > /dev/null 2>&1; then
+    mkdir -p "$HOME/.hermes/logs"
+    nohup hermes gateway run >> "$GWLOG" 2>&1 &
+    sleep 3
+    if pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+      log "微信网关已启动"
+      return 0
+    fi
+    log "ERROR 网关启动后仍无进程，看 $GWLOG"
+    return 1
+  fi
+  log "无微信账号凭据，跳过网关启动"
+  return 0
+}
+
+# --- 安装/升级 hermes（只在真的需要时调用） ---
+install_hermes() {
+  local install_sh=""
+  if curl -fsSL "$INSTALL_URL" -o "$LATEST" 2>/dev/null; then
+    install_sh="$LATEST"
+    cp "$LATEST" "$SAVED"
+    log "使用最新官方安装脚本（已更新本地缓存 $SAVED）"
+  elif [ -f "$SAVED" ]; then
+    install_sh="$SAVED"
+    log "WARN 无法下载最新安装脚本，使用本地缓存 $SAVED"
+  else
+    log "ERROR 安装脚本不可用（无网且无本地缓存），无法安装 hermes"
+    return 1
+  fi
+  if bash "$install_sh" --non-interactive --skip-browser; then
+    export PATH="$HOME/.local/bin:$PATH"
+    hermes --version || log "WARN hermes --version 返回非 0"
+    log "hermes 安装/升级完成"
+    return 0
+  fi
+  log "ERROR 安装脚本执行失败"
+  return 1
+}
+
+# --- 从备份恢复用户数据（只在数据缺失时调用；调用方必须已停网关） ---
+restore_user_data() {
+  if [ ! -d "$BACKUP" ]; then
+    log "ERROR ~/.hermes 数据缺失，且没有备份目录 $BACKUP"
+    return 1
+  fi
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "$BACKUP/" "$HOME/.hermes/"
+  else
+    cp -a "$BACKUP/." "$HOME/.hermes/"
+  fi
+  chmod 600 "$HOME/.hermes/.env" 2>/dev/null || true
+  log "用户数据已从备份恢复"
+  return 0
+}
+
+# ============================ 主流程 ============================
+
+hermes_ok=0
+if command -v hermes >/dev/null 2>&1 && hermes --version >/dev/null 2>&1; then
+  hermes_ok=1
+fi
+data_ok=0
+if [ -f "$HOME/.hermes/config.yaml" ] && [ -f "$HOME/.hermes/state.db" ]; then
+  data_ok=1
+fi
+gw_running=0
+pgrep -f "[g]ateway run" >/dev/null 2>&1 && gw_running=1
+log "检查：hermes_ok=$hermes_ok data_ok=$data_ok gateway_running=$gw_running"
+
+if [ "$hermes_ok" = 1 ] && [ "$data_ok" = 1 ]; then
+  log "hermes 与用户数据都完好：跳过 installer 与数据恢复（不动 state.db）"
+else
+  # 有活要干：先确认网关停干净
+  if [ "$gw_running" = 1 ]; then
+    stop_gateway || { log "ERROR 网关未能停干净，为避免 state.db 被换掉，本次中止"; exit 1; }
+  fi
+  if [ "$hermes_ok" = 0 ]; then
+    install_hermes || rc=1
+  fi
+  if [ "$data_ok" = 0 ]; then
+    restore_user_data || rc=1
+  fi
+fi
+
+start_gateway_if_needed || rc=1
+
+if [ "$rc" = 0 ]; then
+  echo "OK: hermes 已就绪"
+else
+  echo "FAIL: hermes 恢复未完成，详见上面的 [restore-hermes] 日志" >&2
+fi
+exit "$rc"
+```
+
+### 代码 9/13：`backup-hermes.sh`（手动备份，fail closed）
+
+**目标路径**：`~/workspace/setup/backup-hermes.sh`　**权限**：`chmod +x`
+**重要**：这是**手动**脚本，**不要**加进 cron——它每次都会读三个活库，和恢复流程抢 IO 没有意义。
+
+```bash
+#!/usr/bin/env bash
+# backup-hermes.sh — 把 ~/.hermes 里不可再生的用户数据备份到 workspace。
+#
+# 备份内容：config.yaml、.env（含 API Key）、memories/、skills/、sessions/、hooks/ 等
+# 排除内容：hermes-agent/（git 仓库可重下）、tools/（可重装）、cache/、installs/、logs/
+#
+# 安全规则（2026-09-26 复核后收紧为 fail closed）：
+#  ~/.hermes 里有三个 WAL 模式的活跃数据库（state.db / kanban.db / shared-state.db）。
+#  网关运行时用 rsync/cp 直接复制 db+WAL+SHM 会得到跨时刻的撕裂快照——
+#  压测实测单轮最多静默丢 38000 行，而且 `PRAGMA integrity_check` 对撕裂备份
+#  照样返回 ok，也就是说"拷完跑个 integrity_check"根本验证不出这个 bug。
+#  所以：三个库一律 `sqlite3 .backup` 在线热备；
+#  **任何一步失败就地停手（exit 1），绝不回退到裸 cp**——
+#  回退裸 cp 会把一份可能撕裂的库盖到上一份好备份上，等于用坏备份换掉好备份。
+#  失败时保留上一份好备份，并打印明确错误让人来处理。
+#
+# 实现要点（都是实测踩出来的）：
+#  - 热备产物写到 DST 之外的 stage 目录。不能放在 DST 里：rsync --delete 会把
+#    源目录里不存在的文件删掉，临时文件正好会被它顺手清理掉（实测 mv 时文件已消失）。
+#  - 全部成功后才把三个库 mv 进 DST（同文件系统 rename，原子）；失败整次作废，
+#    三个库都保持上一份好备份。
+#  - .last-success 只在整次成功时写，并被 rsync 排除，用来回答"到底哪次成功过"。
+# 退出码：0=全部成功；1=至少一个库失败（旧备份保持不变）。
+set -euo pipefail
+
+SRC="$HOME/.hermes"
+DST="$HOME/workspace/backups/hermes-home"
+STAGE="$HOME/workspace/backups/.hermes-db-stage"
+SQLITE_DBS="state.db kanban.db shared-state.db"
+
+failed=0
+err() { echo "[error] $*" >&2; failed=1; }
+
+mkdir -p "$DST"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+
+# --- 0. 前置检查：有活库就必须有 sqlite3；没有就 fail closed，不做任何降级复制 ---
+need_sqlite=0
+for db in $SQLITE_DBS; do
+  [ -f "$SRC/$db" ] && need_sqlite=1
+done
+if [ "$need_sqlite" = 1 ] && ! command -v sqlite3 >/dev/null 2>&1; then
+  err "本机没有 sqlite3，无法为 3 个 WAL 活库做一致备份。请先装（apt-get install -y sqlite3）后重跑；本次未改动备份目录。"
+  exit 1
+fi
+
+# --- 1. 数据库：在线热备到 stage（完全不碰 DST 里的旧备份） ---
+declare -A TMP_DB=()
+for db in $SQLITE_DBS; do
+  [ -f "$SRC/$db" ] || { echo "[info] $SRC/$db 不存在，跳过"; continue; }
+  tmp="$STAGE/$db"
+  rm -f "$tmp"
+  if ! sqlite3 "$SRC/$db" ".backup '$tmp'" 2>/dev/null; then
+    rm -f "$tmp"
+    err "$db 在线热备失败（sqlite3 .backup 返回非 0）。旧备份已保留，未做任何覆盖。"
+    continue
+  fi
+  # 备份产物自身的可读性检查（注意：这发现不了"撕裂"，撕裂是靠 .backup 本身避免的）
+  if ! sqlite3 "$tmp" "PRAGMA quick_check;" 2>/dev/null | grep -q '^ok$'; then
+    rm -f "$tmp"
+    err "$db 热备产物 quick_check 未返回 ok。旧备份已保留。"
+    continue
+  fi
+  TMP_DB["$db"]="$tmp"
+  echo "[info] $db 在线热备完成（stage）"
+done
+
+# --- 2. 其它文件（排除三个库及其 WAL/SHM，它们走上面的热备路径） ---
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a --delete \
+    --exclude 'hermes-agent/' \
+    --exclude 'tools/' \
+    --exclude 'cache/' \
+    --exclude 'installs/' \
+    --exclude 'logs/' \
+    --exclude '.last-success' \
+    --exclude 'state.db' --exclude 'state.db-wal' --exclude 'state.db-shm' \
+    --exclude 'kanban.db' --exclude 'kanban.db-wal' --exclude 'kanban.db-shm' \
+    --exclude 'shared-state.db' --exclude 'shared-state.db-wal' --exclude 'shared-state.db-shm' \
+    "$SRC/" "$DST/" || err "rsync 复制非数据库文件失败"
+else
+  # 无 rsync 时的降级方案：tar 管道到临时目录再合并
+  rm -rf "$DST.new"
+  mkdir -p "$DST.new"
+  tar --exclude='hermes-agent' --exclude='tools' --exclude='cache' \
+      --exclude='installs' --exclude='logs' \
+      --exclude='state.db' --exclude='state.db-wal' --exclude='state.db-shm' \
+      --exclude='kanban.db' --exclude='kanban.db-wal' --exclude='kanban.db-shm' \
+      --exclude='shared-state.db' --exclude='shared-state.db-wal' --exclude='shared-state.db-shm' \
+      -cf - -C "$HOME" .hermes | tar -xf - -C "$DST.new" --strip-components=1 \
+      || err "tar 复制非数据库文件失败"
+  (cd "$DST.new" && tar -cf - .) | (cd "$DST" && tar -xf -) || err "合并非数据库文件失败"
+  rm -rf "$DST.new"
+fi
+
+# --- 3. 只有全部成功才把热备产物顶上去，并清理残留 WAL/SHM ---
+if [ "$failed" = 0 ]; then
+  for db in $SQLITE_DBS; do
+    [ -n "${TMP_DB[$db]:-}" ] || continue
+    mv -f "${TMP_DB[$db]}" "$DST/$db"
+    rm -f "$DST/$db-wal" "$DST/$db-shm"
+    echo "[info] $db 已就位（原子替换）"
+  done
+  rm -rf "$STAGE"
+  date -Is > "$DST/.last-success"
+  echo "backup -> $DST"
+  du -sh "$DST"
+  exit 0
+fi
+
+# 失败：整次作废，明确保留上一份好备份
+rm -rf "$STAGE"
+echo "[error] 备份未完成：上一份好备份仍原样保留在 $DST（上次成功时间见 $DST/.last-success）" >&2
+exit 1
+```
+
+## 八、步骤 3：离线包缓存（deb + 探针二进制）
+
+**目标**：把 `cron`、`openssh-server` 依赖闭包和 cf-probe 二进制都缓存到 `$HOME`，重建后**不依赖网络**也能装回系统组件。**耗时**：5–15 分钟（取决于网速，约 21MB deb + 7.5MB 二进制）。
+**失败影响**：沙盒重建时若 GitHub / apt 源不可达，探针和 sshd 装不回来。
+
+> 为什么必须"缓存二进制"而不只缓存安装脚本：`install.sh` 自己还要去 GitHub releases 拉 8MB 二进制；
+> 只缓存脚本，断网时照样装不上。**实测（2026-09-26）**：`releases/latest/download/cf-probe-linux-amd64`
+> 下载回来的文件与安装器最终装到 `/usr/local/bin/cf-probe` 的文件 **sha256 完全一致**，且该二进制自带
+> `install / run / uninstall` 子命令，可以直接当安装器用。
+
+### ① AI 执行（命令）
+
+**A. deb 依赖闭包（完整、可复现；不要只 `apt-get download cron openssh-server`）**
+
+```bash
+cd ~/workspace/setup/deb-cache
+
+# 1) 算依赖闭包：从 cron + openssh 出发递归展开，去掉 recommends/suggests/conflicts 等分支
+apt-get update -qq
+apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
+  --no-breaks --no-replaces --no-enhances \
+  cron openssh-server openssh-client openssh-sftp-server 2>/dev/null \
+  | grep '^[a-z0-9]' | sort -u > /tmp/closure.txt
+
+# 2) 只保留"当前镜像里真实安装着"的包：
+#    闭包里会出现 systemd-standalone-sysusers / opensysusers / cdebconf 这类【互斥替代品】，
+#    而 lib-pkgs.sh 是"把缓存里缺的包一次性 dpkg -i"，互相冲突的包会直接装失败。
+while read -r p; do dpkg -l "$p" 2>/dev/null | grep -q '^ii' && echo "$p"; done \
+  < /tmp/closure.txt > /tmp/closure.installed.txt
+grep -vxE 'systemd-standalone-sysusers|opensysusers|cdebconf|libdebian-installer4|libtextwrap1' \
+  /tmp/closure.installed.txt > /tmp/closure.final.txt
+
+# 3) 下载（注意用 apt-get download：它对"已安装"的包也照样下，不用先卸载；
+#    用 install --download-only 会因为"已是最新"而一个都不下）
+cd ~/workspace/setup/deb-cache
+xargs -a /tmp/closure.final.txt apt-get download
+
+# 4) 验证：数量、关键包、可解析
+ls *.deb | wc -l                                   # 期望 ≥ 70（参考实现 74 个，约 21MB）
+for p in cron cron-daemon-common openssh-server openssh-client openssh-sftp-server; do
+  ls ${p}_*.deb >/dev/null 2>&1 && echo "OK  $p" || echo "MISSING $p"
+done
+for d in *.deb; do dpkg-deb -f "$d" Package >/dev/null 2>&1 || echo "BAD $d"; done; echo "全部 .deb 可解析"
+du -sh .                                           # 期望 ~21M
+```
+
+**B. 探针二进制缓存**
+
+```bash
+bash ~/workspace/setup/cache-cf-probe-bin.sh
+ls -l ~/workspace/setup/cf-probe-linux-amd64 ~/workspace/setup/cf-probe-linux-amd64.sha256
+```
+
+**C.（建议）Hermes 安装脚本缓存**：`restore-hermes.sh` 会在下载失败时用 `~/workspace/setup/hermes-install.sh`。首次装完 Hermes 后，确认它存在：
+
+```bash
+ls -l ~/workspace/setup/hermes-install.sh    # 不存在就见步骤 4，restore-hermes.sh 会自动落一份
+```
+
+### ② 对用户说（可原样发送）
+
+> 现在把"重建后要用的安装包"提前缓存到本地。这样沙盒被重建、网络又不好的时候，系统组件也能装回来：
+> - `cron` + `openssh` 及其依赖（约 21MB，70 多个 .deb）
+> - 探针二进制（约 7.5MB）
+>
+> 你什么都不用做，我看完数量继续。
+
+### ③ 用户手动做
+
+无。
+
+### ④ 做完的标志
+
+```bash
+ls ~/workspace/setup/deb-cache/*.deb | wc -l                    # ≥ 70
+ls ~/workspace/setup/cf-probe-linux-amd64 >/dev/null && echo "二进制缓存 OK"
+cat ~/workspace/setup/cf-probe-linux-amd64.sha256               # 有值即可（这是校验和，不是密钥）
+```
+
+判据：deb 数量 ≥ 70、关键包五个都在、二进制缓存存在且带 sha256。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `apt-get download` 报 `Unable to locate package` | apt 列表为空 / 源不可达 | 先 `apt-get update`；仍失败就换源或从能上网的机器拷 .deb 过来 |
+| 一个 .deb 都没下下来 | 用了 `install --download-only`（已安装的包不会重复下载） | 改用 `apt-get download`（本手册的写法） |
+| 数量只有 5、6 个 | 只下了显式列出的包，没算闭包 | 用第 1 步的 `apt-cache depends --recurse` 生成完整列表 |
+| 装的时候 `dpkg` 报冲突 | 缓存里混进了互斥替代品（systemd-standalone-sysusers 等） | 用第 2 步的过滤规则重建列表 |
+| 二进制缓存自检失败 | 下载到的是错误页面（代理/网关拦截） | 删掉重下；确认 `curl -I` 拿到的是 `application/octet-stream` |
+| deb-cache 占空间大 | 闭包包含已装的运行时库（libc6、systemd 等） | 正常，约 21MB；不要为了省空间删依赖 |
+
+## 九、步骤 4：安装 Hermes + 配置模型 API
+
+**目标**：Hermes 装好、能跑，接上用户自己的 OpenAI 兼容模型接口。**耗时**：5–15 分钟（等用户给地址和 Key）。
+**失败影响**：微信机器人没有"大脑"，收到消息不会回。
+
+### ① AI 执行（命令）
+
+```bash
+# 1. 安装/恢复 Hermes（幂等；健康时会自动跳过 installer，见脚本注释）
+bash ~/workspace/setup/restore-hermes.sh
+
+# 2. 确认可用
+export PATH="$HOME/.local/bin:$PATH"
+hermes --version
+
+# 3. 写模型配置（真实地址只写进 config.yaml，不进任何文档）
+#    config.yaml 末尾追加/合并下面两段
+cat >> ~/.hermes/config.yaml <<'YAML_EOF'
+model:
+  default: "<MODEL_NAME>"
+  provider: "my-api"
+providers:
+  my-api:
+    base_url: "<API_BASE_URL>"
+    key_env: "MY_API_KEY"
+YAML_EOF
+
+# 4. Key 写进 .env（600），值从环境变量来，不进 shell 历史
+printf 'MY_API_KEY=%s\n' "$USER_MODEL_KEY" >> ~/.hermes/.env
+chmod 600 ~/.hermes/.env
+unset USER_MODEL_KEY
+
+# 5. 自检：模型配置读得到、Key 存在（只打印布尔值和长度，不打印值）
+grep -q 'my-api' ~/.hermes/config.yaml && echo "provider 配置已写入"
+grep -c '^MY_API_KEY=' ~/.hermes/.env            # 期望 1
+awk -F= '/^MY_API_KEY=/{print "MY_API_KEY 长度: " length($2)}' ~/.hermes/.env
+```
+
+**临时 Key 的处理**：如果用户说"这是临时测试用的"，验证通过后**立即**从 `.env` 删除并告知用户（`sed -i '/^MY_API_KEY=/d' ~/.hermes/.env`，或让用户自己决定是否长期保留）。
+
+**连通性自检**（推荐做，避免"装好了但一问就报错"）：
+
+```bash
+hermes --non-interactive "只回复两个字：在线" 2>&1 | tail -5
+```
+
+### ② 对用户说（可原样发送）
+
+> 现在装 Hermes（微信机器人的大脑）并接你的模型 API。需要你提供两样：
+> 1. **接口地址**：形如 `http://<主机>:<端口>/v1`（OpenAI 兼容）；
+> 2. **API Key**：**走安全页面**发我，别贴在聊天里。
+> 3. **模型名**：你那个接口上要用的模型标识（比如 `deepseek-v4.1-flash` 这类）。
+>
+> 另外确认一句：这个 Key 是**长期使用**还是**临时测试**？
+> - 长期 → 我写到 `~/.hermes/.env`（600 权限，只有本机能读）；
+> - 临时 → 验证通过后我立刻删掉，不留痕迹。
+
+### ③ 用户手动做
+
+- 通过安全页面提供 API 地址与 Key；提供模型名。
+- 说明 Key 是长期还是临时。
+
+### ④ 做完的标志
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+hermes --version                                  # 期望打印版本号
+grep -q 'my-api' ~/.hermes/config.yaml && echo "配置 OK"
+ls -l ~/.hermes/.env                              # 期望 -rw-------（600）
+hermes --non-interactive "只回复两个字：在线" 2>&1 | tail -3   # 期望有正常回复，不是鉴权/连接错误
+```
+
+判据：版本号能打印 + 配置里有 provider + `.env` 权限 600 + 一次真实调用成功。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `hermes: command not found` | `~/.local/bin` 不在 PATH | `export PATH="$HOME/.local/bin:$PATH"`；网关用 `nohup hermes gateway run` 启动时会自带 PATH |
+| 调用报 401/403 | Key 错、过期或没写进 `.env` | `grep -c '^MY_API_KEY=' ~/.hermes/.env`；值不要带引号 |
+| 调用超时 | 地址端口不通 | 让用户确认地址可从沙盒访问（`curl -m 8 <API_BASE_URL>/models`）；国内机房注意出网策略 |
+| installer 反复重装、把网关搞挂 | 旧版 `restore-hermes.sh` 无条件跑 installer | 用本手册的版本：健康时跳过 installer，需要时才停网关 |
+| `.env` 权限变成 644 | 复制/编辑时改了权限 | `chmod 600 ~/.hermes/.env`（里面是所有密钥） |
+
+## 十、步骤 5：绑定微信（扫码登录）
+
+**目标**：微信账号绑定到 Hermes 网关，用户能在微信里跟机器人对话。**耗时**：5 分钟（等用户扫码）。
+**失败影响**：微信里收不到回复；Layer 1 的"网关保活"也就失去意义。
+
+> 机制：Hermes 走 iLink 方案的**机器人**登录——脚本向 iLink 取登录二维码 → 用户用手机微信扫码并确认 →
+> 凭据落到 `~/.hermes/weixin/accounts/<account_id>.json`（内含 token，Hermes 网关读它）。
+> 已知限制（**要如实告诉用户，别让他以为坏了**）：私聊可用；普通微信群消息可能收不到。
+
+### ① AI 执行（命令）
+
+```bash
+# 0. 依赖：二维码渲染需要 qrcode（含 PIL）
+python3 -c 'import qrcode' 2>/dev/null || python3 -m pip install "qrcode[pil]"
+
+# 1. 落盘两个辅助脚本（代码见下）到 ~/workspace/setup/
+#    weixin-qr-fetch.py / weixin-qr-confirm.py
+
+# 2. 取二维码（生成 PNG）
+python3 ~/workspace/setup/weixin-qr-fetch.py      # 输出：QR saved: <...>/weixin-login-qr.png
+
+# 3. 把 PNG 发给用户扫：在会话里用 MEDIA: 标记；如果需要在回合外发，用
+hermes send --to weixin:<chat_id> "MEDIA:$HOME/workspace/your_files/weixin-login-qr.png"
+
+# 4. 立刻开始轮询确认（180 秒内有效）
+python3 ~/workspace/setup/weixin-qr-confirm.py; echo "rc=$?"
+
+# 5. 确认成功后，把网关需要的两项写进 .env（值取自账号 json，不要打印出来）
+python3 - <<'PY'
+import json, glob, os, re
+p = glob.glob(os.path.expanduser("~/.hermes/weixin/accounts/*@im.bot.json"))[0]
+d = json.load(open(p))
+acct = os.path.basename(p).replace(".json", "")
+env = os.path.expanduser("~/.hermes/.env")
+text = open(env).read() if os.path.exists(env) else ""
+add = []
+if "WEIXIN_ACCOUNT_ID=" not in text:
+    add.append(f"WEIXIN_ACCOUNT_ID={acct}")
+if "WEIXIN_TOKEN=" not in text:
+    add.append(f"WEIXIN_TOKEN={d['token']}")
+if add:
+    with open(env, "a") as f:
+        f.write("\n" + "\n".join(add) + "\n")
+print("已写入 .env 的项:", [a.split('=')[0] for a in add], "（值不打印）")
+PY
+chmod 600 ~/.hermes/.env
+
+# 6. 启动网关（后台常驻）
+mkdir -p ~/.hermes/logs
+nohup hermes gateway run >> ~/.hermes/logs/weixin-gateway.log 2>&1 &
+sleep 3; pgrep -f "[g]ateway run" >/dev/null && echo "网关已启动"
+```
+
+### ② 对用户说（可原样发送）
+
+> Hermes 装好了，现在绑定微信。我马上把**二维码**发给你，请：
+> 1. 用**手机微信扫码**；2. 手机上点**确认登录**；3. 扫完跟我说一声。
+>
+> 两点说明：
+> - 二维码有效期约 3 分钟，过期我重新生成一张；
+> - 绑好后**私聊**可用；**普通微信群消息可能收不到**（iLink 的限制，不是故障）。
+>
+> 绑定完成后，请你**在微信里给机器人发一条"你好"**，看到它回复就算全链路通了。
+
+### ③ 用户手动做
+
+- 扫码 + 手机确认登录。
+- 绑定后发一条消息测试。
+
+### ④ 做完的标志
+
+```bash
+compgen -G "$HOME/.hermes/weixin/accounts/*.json" >/dev/null && echo "账号已绑定"
+python3 -c "import glob,os;print([os.path.basename(p) for p in glob.glob(os.path.expanduser('~/.hermes/weixin/accounts/*.json'))])"
+pgrep -f "[g]ateway run" >/dev/null && echo "网关运行中"
+grep -c '^WEIXIN_TOKEN=' ~/.hermes/.env     # 期望 1（只数条数，不看值）
+```
+
+判据：账号 json 存在 + 网关进程在 + `.env` 里有 `WEIXIN_TOKEN` + **用户确认收到机器人回复**。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `ModuleNotFoundError: qrcode` | 没装依赖 | `python3 -m pip install "qrcode[pil]"` |
+| 二维码过期 | 用户扫得太慢 | 重跑 `weixin-qr-fetch.py` 生成新码（`confirm` 脚本会返回 2=expired） |
+| 扫码后无反应 | 网络问题 | 看 `~/.hermes/logs/weixin-gateway.log` 尾部；确认沙盒能访问 iLink 域名 |
+| 能收不能回 / 回复全失败 | `state.db` 被换过（`StateDbReplacedError`） | 停网关 → 让恢复脚本用本手册版本重跑 → 重新起网关（**不要在网关运行时覆盖 `~/.hermes/` 里的数据**） |
+| 群里收不到消息 | iLink 机器人限制 | 如实说明：私聊可用，群聊可能收不到，不是配置问题 |
+| `hermes send` 报 Weixin token missing | `.env` 里缺 `WEIXIN_TOKEN` | 按 ① 的第 5 步补写（网关自身读的是账号 json，所以机器人能收消息但 `hermes send` 会失败） |
+
+### 代码 10/13：`weixin-qr-fetch.py`（取二维码）
+
+**目标路径**：`~/workspace/setup/weixin-qr-fetch.py`
+
+```python
+#!/usr/bin/env python3
+"""取微信（iLink）登录二维码并渲染成 PNG，供用户扫码。
+
+用法：
+    python3 weixin-qr-fetch.py
+产物：
+    $HOME/workspace/your_files/weixin-login-qr.png   ← 把这个 PNG 发给用户扫
+    $HOME/workspace/setup/weixin-qr-state.json       ← 供 weixin-qr-confirm.py 续用
+
+依赖：python3 + qrcode（含 PIL）
+    没有的话先装：python3 -m pip install "qrcode[pil]"
+    或：uv pip install --python "$(command -v python3)" "qrcode[pil]"
+"""
+import json
+import os
+import subprocess
+import sys
+
+try:
+    import qrcode
+except ImportError:  # 给出可执行的提示，别只抛 ModuleNotFoundError
+    print('缺少 qrcode 模块。请先执行: python3 -m pip install "qrcode[pil]"', file=sys.stderr)
+    sys.exit(4)
+
+HOME = os.path.expanduser("~")
+BASE_URL = "https://ilinkai.weixin.qq.com"
+APP_ID = "bot"
+CLIENT_VERSION = str((2 << 16) | (2 << 8) | 0)
+STATE_PATH = os.path.join(HOME, "workspace", "setup", "weixin-qr-state.json")
+PNG_PATH = os.path.join(HOME, "workspace", "your_files", "weixin-login-qr.png")
+
+
+def api_get(endpoint: str) -> dict:
+    out = subprocess.run(
+        [
+            "curl", "-s", "-m", "30",
+            "-H", f"iLink-App-Id: {APP_ID}",
+            "-H", f"iLink-App-ClientVersion: {CLIENT_VERSION}",
+            f"{BASE_URL}/{endpoint}",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(out.stdout)
+
+
+def main() -> int:
+    data = api_get("ilink/bot/get_bot_qrcode?bot_type=3")
+    qrcode_value = str(data.get("qrcode") or "")
+    qrcode_url = str(data.get("qrcode_img_content") or "")
+    if not qrcode_value:
+        print(f"QR response missing qrcode: {data}", file=sys.stderr)
+        return 1
+    scan_target = qrcode_url or qrcode_value
+    os.makedirs(os.path.dirname(PNG_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    qr = qrcode.QRCode(box_size=10, border=4)
+    qr.add_data(scan_target)
+    qr.make(fit=True)
+    qr.make_image(fill_color="black", back_color="white").save(PNG_PATH)
+    with open(STATE_PATH, "w") as f:
+        json.dump({"qrcode": qrcode_value, "qrcode_url": qrcode_url}, f)
+    os.chmod(STATE_PATH, 0o600)
+    print(f"QR saved: {PNG_PATH}")
+    print("下一步：把这个 PNG 发给用户扫，然后跑 weixin-qr-confirm.py 等确认（180 秒内）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### 代码 11/13：`weixin-qr-confirm.py`（轮询确认并落盘凭据）
+
+**目标路径**：`~/workspace/setup/weixin-qr-confirm.py`
+
+```python
+#!/usr/bin/env python3
+"""轮询 iLink 二维码状态，用户确认后把微信账号凭据落盘到 ~/.hermes/weixin/accounts/。
+
+用法：
+    python3 weixin-qr-confirm.py        # 需先跑 weixin-qr-fetch.py 生成 state 文件
+退出码：
+    0=已确认并落盘  1=凭据不完整  2=二维码过期  3=180 秒超时  4=缺依赖/缺 state
+
+落盘文件：$HOME/.hermes/weixin/accounts/<account_id>.json（600），
+内容 {"token", "base_url", "user_id", "saved_at"} —— Hermes 微信网关读的就是这个目录。
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+BASE_URL = "https://ilinkai.weixin.qq.com"
+APP_ID = "bot"
+CLIENT_VERSION = str((2 << 16) | (2 << 8) | 0)
+STATE_PATH = os.path.join(HOME, "workspace", "setup", "weixin-qr-state.json")
+HERMES_HOME = os.path.join(HOME, ".hermes")
+
+
+def api_get(base: str, endpoint: str) -> dict:
+    out = subprocess.run(
+        [
+            "curl", "-s", "-m", "35",
+            "-H", f"iLink-App-Id: {APP_ID}",
+            "-H", f"iLink-App-ClientVersion: {CLIENT_VERSION}",
+            f"{base}/{endpoint}",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(out.stdout)
+
+
+def main() -> int:
+    if not os.path.exists(STATE_PATH):
+        print(f"缺少 {STATE_PATH}：请先跑 weixin-qr-fetch.py", file=sys.stderr)
+        return 4
+    with open(STATE_PATH) as f:
+        state = json.load(f)
+    qrcode = state["qrcode"]
+    base = BASE_URL
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        try:
+            resp = api_get(base, f"ilink/bot/get_qrcode_status?qrcode={qrcode}")
+        except Exception as exc:  # 网络抖动：继续轮询，别放弃
+            print(f"poll error: {exc}", file=sys.stderr)
+            time.sleep(2)
+            continue
+        status = str(resp.get("status") or "wait")
+        if status == "confirmed":
+            account_id = str(resp.get("ilink_bot_id") or "")
+            token = str(resp.get("bot_token") or "")
+            base_url = str(resp.get("baseurl") or base)
+            user_id = str(resp.get("ilink_user_id") or "")
+            if not account_id or not token:
+                print("confirmed but credential payload incomplete", file=sys.stderr)
+                return 1
+            acct_dir = os.path.join(HERMES_HOME, "weixin", "accounts")
+            os.makedirs(acct_dir, exist_ok=True)
+            path = os.path.join(acct_dir, f"{account_id}.json")
+            payload = {
+                "token": token,
+                "base_url": base_url.rstrip("/"),
+                "user_id": user_id,
+                "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, path)   # 原子落盘，避免网关读到半个文件
+            os.chmod(path, 0o600)
+            print(f"OK account_id={account_id} user_id={user_id}")
+            print("下一步：把 WEIXIN_TOKEN / WEIXIN_ACCOUNT_ID 写进 ~/.hermes/.env，再启动网关")
+            return 0
+        if status == "expired":
+            print("QR expired before confirmation", file=sys.stderr)
+            return 2
+        if status == "scaned_but_redirect" and resp.get("redirect_host"):
+            base = f"https://{resp['redirect_host']}"
+        # wait / scaned -> 继续轮询
+        time.sleep(2)
+    print("timed out waiting for confirmation", file=sys.stderr)
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## 十一、步骤 6：Layer 1 — 沙盒内看门狗（写入 cron）
+
+**目标**：沙盒内的 cron 每分钟巡检一次，进程挂了就地拉起来。**耗时**：2 分钟。
+**失败影响**：进程挂掉只能等平台巡检（最坏 1 分钟 + 恢复 2 分钟），比看门狗慢一档。
+
+### ① AI 执行（命令）
+
+```bash
+# 写入 crontab（幂等：重复执行不会写出两行）
+(crontab -l 2>/dev/null | grep -v "watchdog.sh"; echo "* * * * * $HOME/workspace/setup/watchdog.sh") | crontab -
+crontab -l
+
+# 手动跑一次看门狗，确认能跑通、日志有输出
+bash ~/workspace/setup/watchdog.sh; echo "rc=$?"
+tail -10 ~/workspace/setup/logs/watchdog.log
+```
+
+### ② 对用户说（可原样发送）
+
+> 现在开第一层保活：沙盒自己的看门狗，每分钟检查探针、微信网关、SSH，挂了自动拉起。
+> 另外它还会看**微信连接是否卡死**——进程活着不等于连接活着，日志里持续报错超过 5 分钟就重启网关。
+> 你不用做任何事，我来配。
+
+### ③ 用户手动做
+
+无。
+
+### ④ 做完的标志
+
+```bash
+crontab -l | grep watchdog                                  # 期望一行
+tail -3 ~/workspace/setup/logs/watchdog.log                 # 期望有 "巡检完成"
+test -d ~/workspace/setup/.watchdog.lock && echo "有锁残留（不正常）" || echo "无锁残留（正常）"
+```
+
+判据：cron 里有且只有一行 watchdog + 日志有"巡检完成" + 跑完没有留下锁目录。等 2 分钟后 `tail` 日志应该能看到新的时间戳（证明 cron 真的在跑）。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `crontab: command not found` | 没装 cron | 见步骤 3 的离线包，`bash ~/workspace/setup/restore-all.sh` 会补装 |
+| 日志不再增长 | cron 守护进程没跑 | `pgrep -f "[/]usr/sbin/cron"`；`service cron start` |
+| 出现两行 watchdog | 用了 `crontab -e` 手工加过 | 先 `crontab -l | grep -v watchdog.sh | crontab -` 清干净，再按上面的幂等写法写 |
+| 看门狗反复重启网关 | 网关真的起不来 | 看 `~/.hermes/logs/weixin-gateway.log`，通常是账号凭据丢了或 state.db 异常 |
+| 锁目录残留导致跳过巡检 | 上一次被强杀 | 看门狗会自己校验 PID+cmdline 回收 stale 锁；若目录里没有 pid 文件则直接回收 |
+
+## 十二、步骤 7：平台端授权（Layer 2 的前置动作）
+
+**目标**：拿到平台侧权限，才能创建"平台定时任务"和"开机钩子"。**耗时**：2–5 分钟（等用户点授权）。
+**失败影响**：没有 Layer 2，就只剩沙盒内看门狗——**整机重建后没人恢复**，这是最危险的单点。
+
+> 这两项（定时任务、开机钩子）跑在沙盒**外面**，沙盒重建也杀不死它们。它们只能由**平台侧 Agent（Muse）**
+> 或**用户在平台端**创建。如果你是在沙盒里跑的 Agent：把第 8、9 步的现成定义与提示词交给平台侧，请他们执行。
+
+### ① AI 执行（命令）
+
+```bash
+# 验证平台侧的目录可写（不同平台路径不同，Muse/hatch 是 /home/hatch/hooks/）
+ls -ld /home/hatch/hooks /home/hatch/hooks/definitions /home/hatch/hooks/scripts 2>/dev/null
+touch /home/hatch/hooks/definitions/.write-test && rm -f /home/hatch/hooks/definitions/.write-test \
+  && echo "hooks 目录可写" || echo "ERROR: hooks 目录不可写"
+ls -l /home/hatch/init.sh 2>/dev/null || echo "init.sh 尚未创建（步骤 9 会建）"
+```
+
+### ② 对用户说（可原样发送）
+
+> 接下来要设平台级的保活（跑在沙盒外面的三层兜底），需要你在平台端确认三件事：
+>
+> **1. 允许创建平台定时任务**：我要建一个每分钟运行的任务（名字 `sandbox-keepalive-monitor`），它独立于沙盒，重建也不会死。创建时如果弹授权卡片，请点**允许**。
+> **2. 允许注册开机钩子**：我要注册一个开机钩子（`home-init`），沙盒每次启动自动跑一次恢复。有权限提示请允许。
+> **3. 允许开机命令以 root 执行**：钩子入口 `init.sh` 需要 root 权限（chmod 700），它要装系统包、写 systemd、起 sshd。平台提示权限申请时请批准。
+>
+> 三项都确认后跟我说"授权好了"。
+
+### ③ 用户手动做
+
+- 在平台端批准上面三项（定时任务 / 开机钩子 / root 执行）。
+- 回复"授权好了"。
+
+### ④ 做完的标志
+
+```bash
+# 1) hooks 目录可写
+touch /home/hatch/hooks/definitions/.write-test && rm -f /home/hatch/hooks/definitions/.write-test \
+  && echo "hooks 可写"
+# 2) 用户明确说了"授权好了"
+```
+
+判据：目录可写 + 用户口头确认。**没有用户确认不要往下走**——就算目录能写，平台侧可能仍然拒绝执行。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 创建任务时被拒 | 平台策略限制 | 让用户在平台端手动创建（把第 8 步的定义与提示词给他） |
+| hooks 目录不可写 | 权限/属主不对 | `ls -ld` 看属主；沙盒里通常是 root，必要时 `chown`（改系统层要跟用户报备） |
+| 用户说"没有授权卡片" | 平台直接放行 | 正常，继续；后面用"任务真的建成了没有"来验证 |
+
+## 十三、步骤 8：Layer 2a — 平台定时巡检（真正的兜底）
+
+**目标**：沙盒外面每分钟检查一次健康，坏了自动跑恢复。**耗时**：5 分钟。
+**失败影响**：沙盒重建后只能等人发现（这是本体系最重要的一环）。
+
+> 设计要点：**退出码就是契约**。`health-check.sh` 返回 0 = 健康（静默，绝不打扰用户）；
+> 返回 1 = 需要恢复（自动跑 `restore-all.sh`，成功才通知用户）；返回 2 = 环境异常（跳过，下轮再试）。
+> 恢复是幂等的，重复触发安全。
+
+### ① AI 执行（命令）
+
+由平台侧 Agent 创建任务（沙盒内的 Agent 没有平台任务工具时，把下面的定义原样交给平台侧/用户）：
+
+- **任务 id**：`sandbox-keepalive-monitor`
+- **标题**：`沙盒保活巡检`
+- **周期**：每 **1 分钟**（interval 1m）
+- **时区**：`Asia/Shanghai`
+- **超时**：1200 秒
+- **执行内容**：下面这段提示词（原文照搬即可）
+
+```text
+你是沙盒保活巡检员，负责 Andy 沙盒的存活监控。沙盒是平台管理的临时虚拟机，可能被重建；你的任务是及时发现并自动恢复。
+
+每轮只做以下步骤：
+
+1. 用 exec 运行 `bash ~/workspace/setup/health-check.sh`，看退出码。
+2. 退出码 0（健康）：什么都不做，不要给用户发任何消息。把这次"健康"结果追加记到当天的 `~/memory/YYYY-MM-DD.md` 日志即可。
+3. 退出码 1（需要恢复：疑似沙盒被重建，或 cf-probe / hermes 微信网关 / sshd / cron 关键服务挂了）：
+   a. 后台执行 `bash ~/workspace/setup/restore-all.sh` 并等待它完成（约 2 分钟，最多等 15 分钟）。该脚本幂等，可安全重跑。
+   b. 完成后重跑 `health-check.sh` 验证。
+   c. 恢复成功：在当前聊天给用户发一条简短中文通知，说明检测到了什么（如"沙盒被重建"还是"某服务挂了"）、已自动恢复、各服务当前状态。
+   d. 恢复失败：在当前聊天告诉用户失败了、最后看到的错误是什么（看 `~/workspace/setup/logs/restore.log` 尾部），请用户指示下一步，不要自己反复重试。
+4. 退出码 2 或 exec 连不上沙盒：本轮跳过，5 分钟后下一轮再试；连续 3 轮都失败才通知用户。
+
+铁律：
+- 绝不在任何消息、日志正文或回复中复述探针 API_SECRET（它在 `~/workspace/setup/install-cf-probe.sh`，600 权限）。
+- 不要编辑 `~/MEMORY.md`；观察记到 `~/memory/YYYY-MM-DD.md`。
+- 健康时保持静默，只有"触发了恢复"才打扰用户。
+```
+
+创建后验证任务真的在平台里（Muse/hatch 上任务定义落在 `~/workspace/goals/goal/crons/minutely/`）：
+
+```bash
+ls -l ~/workspace/goals/goal/crons/minutely/                # 期望看到 sandbox-keepalive-monitor__interval@1m.md
+grep -E '^(id|enabled|title|every|timeout_secs):' ~/workspace/goals/goal/crons/minutely/*keepalive*.md
+```
+
+### ② 对用户说（可原样发送）
+
+> 现在设第二层：平台级定时巡检。它跑在沙盒外面，每分钟检查一次——**沙盒被重建它也不会死**。
+>
+> 发现重建或服务挂掉，它会自动跑恢复（约 2 分钟），成功后才通知你；健康的时候完全静默，不打扰你。
+> 你这边只要确认任务建起来了就行，我继续。
+
+### ③ 用户手动做
+
+- 如果平台要求，确认任务创建（点允许 / 在任务列表里看到 `沙盒保活巡检`）。
+
+### ④ 做完的标志
+
+```bash
+bash ~/workspace/setup/health-check.sh; echo "退出码=$?"     # 期望 0
+ls ~/workspace/goals/goal/crons/minutely/ | grep keepalive   # 平台任务的落盘定义（若有该目录）
+```
+
+判据：`health-check.sh` 返回 0（当前是健康的）+ 平台任务列表里能看到且状态启用 + 用户确认。
+**真正验证它活着**：让用户看平台的任务运行历史（Muse 用 `cron.runs`）——"计划存在"不等于"跑过了"，运行记录才算数。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `health-check.sh` 返回 1 | 有服务确实挂了 | 这正是它该有的行为：先手动 `bash ~/workspace/setup/restore-all.sh` 修好，再看退出码变 0 |
+| 任务建了但不跑 | 平台任务被暂停 / 周期写错 | 平台任务列表里看 enabled 与 schedule；周期必须是 1 分钟 |
+| 恢复被反复触发 | 恢复本身不幂等，或有服务永久起不来 | 看 `~/workspace/setup/logs/restore.log`；`restore-all.sh` 有原子锁，重复触发只会有一个在跑 |
+| 用户被反复打扰 | 提示词里"健康时静默"被漏掉 | 提示词原文照搬，别自己精简 |
+| 平台端没有 cron 机制 | 平台不支持 | 退化为"开机钩子 + 沙盒内看门狗"两层，并如实告知用户风险（重建后恢复会慢或不发生）|
+
+## 十四、步骤 9：Layer 2b — 平台原生开机钩子
+
+**目标**：沙盒每次启动自动跑一次恢复（比每分钟巡检更快）。**耗时**：5 分钟。
+**失败影响**：重建后要等平台巡检（最多 1 分钟）才开始恢复，恢复慢一档（但仍有兜底）。
+
+> 机制（Muse/hatch 平台）：平台每 60 秒轮询 `/home/hatch/hooks/definitions/` 下的钩子定义；
+> 钩子脚本由平台的 hook runtime 执行，脚本必须 `source "${HATCH_HOOK_RUNTIME:?}"` 并调用 `silent` / `wake` / `log`；
+> 用 `/run`（内存盘，重启清零）里的 `started` 标记实现"每次启动恰好跑一次"；`flock` 防并发。
+> **`/home/hatch/init.sh` 必须可执行（chmod 700）才会生效**——这是启用开关。
+> 每次启动只跑一次、**失败不重试**（`started` 先落盘），失败兜底交给步骤 8 的每分钟巡检。
+
+### ① AI 执行（命令）
+
+```bash
+mkdir -p /home/hatch/hooks/definitions /home/hatch/hooks/scripts /home/hatch/hooks/state /home/hatch/hooks/logs
+# 落盘三个文件（代码见下）
+chmod +x /home/hatch/hooks/scripts/home-init.sh
+chmod 700 /home/hatch/init.sh
+ls -l /home/hatch/hooks/definitions/home-init.json /home/hatch/hooks/scripts/home-init.sh /home/hatch/init.sh
+```
+
+### ② 对用户说（可原样发送）
+
+> 最后一层：开机钩子。沙盒每次启动会自动跑一次恢复（实测整条恢复链路约 100 秒），比每分钟巡检更快。
+> 装完这三层保活就齐了：沙盒内看门狗、平台每分钟巡检、开机自动恢复。
+> 你不需要做任何事，我装完给你一份验证清单。
+
+### ③ 用户手动做
+
+无（若平台在注册钩子时弹权限提示，按步骤 7 的授权走）。
+
+### ④ 做完的标志
+
+```bash
+ls -l /home/hatch/init.sh                                 # 期望 -rwx------（700）
+ls -l /home/hatch/hooks/scripts/home-init.sh              # 期望可执行
+jq -e '.enabled == true and .poll_interval_secs == 60' /home/hatch/hooks/definitions/home-init.json
+bash -n /home/hatch/hooks/scripts/home-init.sh && echo "home-init.sh 语法 OK"
+bash -n /home/hatch/init.sh && echo "init.sh 语法 OK"
+```
+
+判据：三个文件都在、权限对、`jq` 断言通过、两个脚本语法 OK。
+**端到端验证**（可选但强烈推荐）：确认钩子第一次真的执行过——看 `/tmp/home-init.log`（当次启动）
+和 `~/workspace/setup/logs/restore.log`（持久）；钩子第二次调用应当返回 `silent "already run"`（门控生效）。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 钩子不跑 | `init.sh` 没有执行位（700） | `chmod 700 /home/hatch/init.sh` —— 这是启用开关 |
+| 钩子每次都跑 | 平台不轮询 `/run` 标记或 `/run` 被清 | 检查 `/run/hatch-home-init/started`；注意 `/run` 是 tmpfs，重启即清空（这正是"每次启动一次"的实现） |
+| 脚本报 `HATCH_HOOK_RUNTIME is unset` | 没 source 平台 runtime（或不是平台调用） | 必须由平台调用；脚本里保留 `source "${HATCH_HOOK_RUNTIME:?}"` |
+| 恢复跑失败但没人管 | 开机钩子失败不重试 | 这是设计如此：靠步骤 8 的每分钟巡检兜底；确认巡检在跑 |
+| 钩子把 `/home/hatch/hooks` 下的东西弄丢 | `/home/hatch` 之外的东西在重建后丢失 | 钩子相关文件都放在 `/home/hatch/hooks/`（持久）下，不要放 `/tmp` |
+
+### 代码 12/13：`home-init.json`（钩子注册）
+
+**目标路径**：`/home/hatch/hooks/definitions/home-init.json`
+
+```json
+{"created_at_ms":0,"delivery":{"surface":"main"},"enabled":true,"id":"home-init","poll_interval_secs":60,"prompt":"Managed Home initialization hook. Its script always returns silent.","script_path":"/home/hatch/hooks/scripts/home-init.sh","script_timeout_secs":600,"updated_at_ms":0,"version":1}
+```
+
+### 代码 13/13：`home-init.sh`（钩子轮询脚本）与 `init.sh`（开机命令）
+
+**目标路径**：
+- `/home/hatch/hooks/scripts/home-init.sh`（`chmod +x`）
+- `/home/hatch/init.sh`（`chmod 700`，**必须可执行才生效**）
+
+```bash
+#!/bin/bash
+set -e
+umask 077
+source "${HATCH_HOOK_RUNTIME:?}"
+[[ "${HATCH_HOOK_DRY_RUN:-0}" == 1 ]] && silent "dry-run"
+[[ -x /home/hatch/init.sh ]] || silent "waiting for init.sh"
+mkdir -p /run/hatch-home-init
+exec 9>/run/hatch-home-init/lock
+flock -n 9 || silent "running"
+[[ ! -e /run/hatch-home-init/started ]] || silent "already run"
+cd /home/hatch
+{
+    touch /run/hatch-home-init/started  # 每次启动只尝试一次，失败也不重跑。
+    printf '\n[%s] init started\n' "$(date -Is)"
+    /bin/bash ./init.sh 9>&- </dev/null && rc=0 || rc=$?
+    printf '[%s] init exited: %s\n' "$(date -Is)" "$rc"
+} >>/tmp/home-init.log 2>&1
+silent "already run"
+```
+
+```bash
+#!/bin/bash
+# /home/hatch/init.sh — 平台 home-init 钩子：每次沙盒启动后自动运行一次。
+# 运行身份为 root，工作目录为 /home/hatch。必须可执行（chmod 700）才会生效。
+#
+# 幂等：直接复用 Layer 3 的 restore-all.sh
+#   （基础包 cron/openssh → hermes → cf-probe → 看门狗 cron → sshd → 看门狗终检）
+#
+# 注意：home-init 每启动只跑一次、失败不重试。
+# 失败兜底由平台定时任务 sandbox-keepalive-monitor（每分钟跑 health-check.sh）负责。
+set -euo pipefail
+
+# HOME 加固：若当前 HOME 下找不到 setup 目录但 /home/hatch 下有，纠正后再继续
+if [ ! -d "${HOME:-}/workspace/setup" ] && [ -d /home/hatch/workspace/setup ]; then
+  export HOME=/home/hatch
+fi
+
+RESTORE=/home/hatch/workspace/setup/restore-all.sh
+if [[ ! -x "$RESTORE" ]]; then
+  echo "ERROR: $RESTORE 缺失或不可执行" >&2
+  exit 1
+fi
+
+exec "$RESTORE"
+```
+
+## 十五、步骤 10：MuseAutoApprove 是什么（先定策略）
+
+**目标**：说清机制与副作用，让用户定决策策略。**耗时**：5 分钟。
+**失败影响**：不装它，沙盒每次访问新域名都弹审批卡片等人点；`npm install`、模型 API 调用都会卡住。
+
+> **机制**：沙盒发起外联（`npm`、`curl`、模型 API……）时，未被规则覆盖的域名会弹审批卡片（HITL）等人点"允许"。MuseAutoApprove 用你的 muse.ai 账号自动登录、连上 hatch 网关的加密 RPC 通道（`wss://hatch.metaaivm.com`），每 10 秒拉一次审批列表并自动决策——默认 `allow_always + destination_domain`，服务端落库**永久网络规则**，同域名以后不再弹单。
+>
+> 它是纯 Node 的协议复刻（无浏览器），跑在沙盒里，只与 `muse.ai` / `hatch.metaaivm.com` 通信，不向第三方发送数据。`data/` 有账号密码、登录会话、token；`log/` 有账号邮箱与审批记录——都在 `$HOME` 下（700/600），不外发、不提交。
+
+| 事项 | 说明 |
+|---|---|
+| 登录 | 邮箱+密码；服务端会发一封验证码邮件，**本工具不读邮件** |
+| 会话 | `hatch_sess` 30 天，每 5 分钟 token touch 滚动续期——30 天内跑过一次即永续 |
+| 轮询 | 默认 10 秒一轮 |
+| 默认决策 | `allow_always + destination_domain`；失败回退 `allow_once` |
+| 保守决策 | `--decision allow_once`：只批本次，不落永久规则 |
+| 生效范围 | 仅本账号、所连 VM 的审批流 |
+
+### ① AI 执行（命令）
+
+```bash
+ls "$HOME/workspace/muse-guardian/MuseAutoApprove/muse-daemon.cjs" 2>/dev/null \
+  && echo "已安装（升级见第 24 章）" || echo "尚未安装"
+```
+
+确认尚未安装后，按 ② 与用户确认策略，再进下一步。用户没明确表态就不要动。
+
+### ② 对用户说（可原样发送）
+
+> 装一个"自动点同意"的组件（MuseAutoApprove）。沙盒每次访问新域名，平台会弹卡片等你点"允许"，不点就卡住；这个组件用你的 muse.ai 账号把这一步自动做掉。
+>
+> 要你定一个策略：
+> - **A. 永久允许**（推荐）：同域名批一次永久放行，之后基本不再看到卡片；
+> - **B. 每次只批一次**（保守）：域名不被永久记住。
+>
+> 另外它需要你的 muse.ai 账号密码——下一步说给法（可以你自己填文件，我不碰）。装的过程会弹一两次卡片（GitHub、npm），那两次请手动点允许。
+> 回"A"或"B"，我就继续。
+
+### ③ 用户手动做
+
+- 选策略 A 或 B。
+
+### ④ 做完的标志
+
+- 用户明确回复 A 或 B（没回复不要往下走）。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 处理 |
+|---|---|
+| 用户担心"自动同意"不安全 | 改 B（每次只批一次）；或先不装 |
+| 用户不想把密码给 AI | 用户自己在沙盒里写 `data/credentials.json`，AI 不接触明文 |
+| 用户想只放行指定域名 | 本工具没有白名单：要么 B，要么继续手工点卡片 |
+
+---
+
+## 十六、步骤 11：安装（Node + git clone + 依赖）
+
+**目标**：Node ≥ 20.18 就位、代码 clone 到 `~/workspace/muse-guardian`、依赖装齐、语法自检全过。**耗时**：5–15 分钟。
+**失败影响**：装不上就没有自动审批。
+
+> 全部装在 `$HOME` 下：代码、`node_modules`、Node 运行时、凭据、会话——重建后都在。
+
+### ① AI 执行（命令）
+
+```bash
+# 1) Node ≥ 20.18：有就跳过；没有/过旧 → 装 $HOME/.local（重建不丢）
+command -v node && node -v || echo "no node"
+```
+
+```bash
+# 无 Node 或版本低时（示例版本，按需换 22.x 最新补丁号）：
+case "$(uname -m)" in x86_64|amd64) A=x64;; aarch64|arm64) A=arm64;; *) echo "未知架构 $(uname -m)"; exit 1;; esac
+V=v22.16.0
+mkdir -p "$HOME/.local" /tmp/ni
+curl -fL -o /tmp/ni/node.tar.gz "https://nodejs.org/dist/$V/node-$V-linux-$A.tar.gz"
+tar -xzf /tmp/ni/node.tar.gz -C "$HOME/.local" --strip-components=1 --exclude='CHANGELOG.md' --exclude='LICENSE' --exclude='README.md'
+export PATH="$HOME/.local/bin:$PATH"; node -v && npm -v
+```
+
+```bash
+# 2) 克隆仓库（更新 = git pull），app 在仓库的 MuseAutoApprove/ 子目录
+cd ~/workspace
+[ -d muse-guardian/.git ] && git -C muse-guardian pull --ff-only \
+  || git clone https://github.com/bytehola/muse-guardian.git
+ls muse-guardian/MuseAutoApprove/muse-daemon.cjs
+
+# 3) 装依赖 + 双自检
+cd muse-guardian/MuseAutoApprove
+npm install --no-audit --no-fund
+node -e "require('undici');require('ws');require('https-proxy-agent');require('sodium-native');console.log('deps OK')"
+for f in muse-daemon.cjs work/*.cjs; do node --check "$f" || echo "FAIL $f"; done; echo "语法检查完成"
+
+# 4) 目录与权限
+mkdir -p data log && chmod 700 data
+```
+
+> **首次安装的鸡生蛋**：`git clone` / `npm install` 自己也要出网，可能弹审批卡片（`github.com`、`registry.npmjs.org`、`nodejs.org`）——此时自动审批还没起来，需要用户手动点一次"允许"。点过之后，同类请求就永久放行了。
+
+**装完后读一遍 `~/workspace/muse-guardian/MuseAutoApprove/README.md`**——里面有这个工具的目录结构、CLI 命令、环境变量和日志字段说明。后续排障和回答用户追问时用得上，不要只照本 SKILL.md 的模板复述。
+
+### ② 对用户说（可原样发送）
+
+> 开始装。过程可能弹一两次审批卡片（GitHub、npm），**请手动点允许**——就这一次，之后同类请求自动审批组件会替你处理。
+> 装完我把自检结果给你看。
+
+### ③ 用户手动做
+
+- 平台弹卡片时手动点允许。
+
+### ④ 做完的标志
+
+```bash
+cd ~/workspace/muse-guardian/MuseAutoApprove
+node -v                                                                   # ≥ v20.18
+ls muse-daemon.cjs package.json work/*.cjs | wc -l                        # 期望 9
+node -e "require('undici');require('ws');require('https-proxy-agent');require('sodium-native');console.log('deps OK')"
+for f in muse-daemon.cjs work/*.cjs; do node --check "$f" || echo "FAIL $f"; done; echo "语法检查完成"
+```
+
+### ⑤ 常见失败与处理
+
+| 现象 | 处理 |
+|---|---|
+| `git clone` 超时/被拦 | 让用户放行 `github.com`；或本机打包 `MuseAutoApprove/` 整目录传进沙盒（走整包拷贝，别手抄单文件） |
+| `npm install` 超时/被拦 | 放行 `registry.npmjs.org`；或换镜像 `npm config set registry https://registry.npmmirror.com`；或用离线 `node_modules` 包 |
+| `sodium-native` 编译失败 | `apt-get install -y build-essential python3` 后重装；或用同架构的离线 `node_modules` |
+| `node --check` 某文件 FAIL | 文件截断/损坏：`git -C ~/workspace/muse-guardian checkout -- MuseAutoApprove/<file>` |
+| bash 报 `$'\r'` | 从文档复制时带上了 CRLF：`sed -i 's/\r$//' <文件>` |
+
+---
+
+## 十七、步骤 12：凭据与自动登录
+
+**目标**：凭据落盘（文件方式，长期必须）、验证登录链路。**耗时**：5 分钟。
+**失败影响**：会话过期后无法自动重登；重建后若会话也失效，守护进程起不来（退出码 2）。
+
+> **凭据查找顺序**：环境变量 `MUSE_USER`/`MUSE_PASSWORD` > 文件 `data/credentials.json`。
+> **长期运行必须用文件**：cron、重建恢复拉起的进程读不到 shell 环境变量。**"会话过期后能否自动重登"完全取决于这个文件**。
+> **登录流程**：restart → send-otp（服务端会发一封验证码邮件，**工具不读它**）→ confirm-password（密码信封）→ `hatch_sess` 30 天。
+> **会话永续**：守护进程每 5 分钟 token touch 滚动续期——30 天内跑过一次就永续。
+> **自愈**：会话丢失/过期 → 下次连接自动重登（日志 `connect_retry ENOENT` → `auto_login_ok` 是正常路径）。
+
+### ① AI 执行（命令）
+
+**方式一（推荐）：用户自己写文件，AI 不接触明文**
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove
+# 告诉用户路径与内容，让用户自己创建：
+#   ~/workspace/muse-guardian/MuseAutoApprove/data/credentials.json
+#   {"email":"<muse.ai 邮箱>","password":"<muse.ai 密码>"}
+# 用户填好后，AI 只做结构校验与权限收紧（不打印密码）：
+cd "$APP"; chmod 700 data 2>/dev/null; chmod 600 data/credentials.json
+ls -l data/credentials.json
+node -e 'const j=JSON.parse(require("fs").readFileSync("data/credentials.json","utf8"));console.log("email:",(j.email||"").replace(/^(.).*(@.*)$/,"$1***$2"),"| password:",j.password?"有":"缺")'
+```
+
+**方式二：用户经安全页面发给 AI，AI 落盘（不复述、不回显）**
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove; cd "$APP"
+mkdir -p data && chmod 700 data
+# 值从环境变量来（不进 shell 历史）；用 node 写文件，避免特殊字符破坏 JSON
+MUSE_EM="<邮箱>" MUSE_PW="<密码>" node -e '
+  require("fs").writeFileSync("data/credentials.json",
+    JSON.stringify({email:process.env.MUSE_EM,password:process.env.MUSE_PW},null,2),{mode:0o600});
+  console.log("written");
+'
+chmod 600 data/credentials.json
+```
+
+> ⚠️ **不要**把密码写进命令行参数（`ps` 可见）或 `echo`（历史留档）。
+
+**验证（两步）**：
+
+```bash
+cd "$APP"
+node muse-daemon.cjs --check       # 离线体检：凭据来源 + 会话状态（不出网）
+node muse-daemon.cjs --smoke       # 真登录一次：会发一封验证码邮件（无需读码）→ SMOKE OK
+```
+
+### ② 对用户说（可原样发送）
+
+> 需要你的 muse.ai 账号密码。两种给法：
+>
+> **A（推荐，我不碰密码）**：你自己创建文件 `~/workspace/muse-guardian/MuseAutoApprove/data/credentials.json`，内容一行：
+> `{"email":"你的邮箱","password":"你的密码"}`，然后 `chmod 600` 它。
+>
+> **B**：走安全页面发我，我写进沙盒并设 600，聊天里不会出现密码。
+>
+> 两点说明：登录时 muse.ai 会往你邮箱**发一封验证码邮件，不用读**（流程必需，工具不读码）；会话 30 天滚动续期，**只要 30 天内跑过一次就永续**，平时不用重复登录。
+
+### ③ 用户手动做
+
+- A：自己创建并填文件，`chmod 600`，说"填好了"。
+- B：经安全页面提供邮箱+密码。
+
+### ④ 做完的标志
+
+```bash
+cd ~/workspace/muse-guardian/MuseAutoApprove
+node muse-daemon.cjs --check; echo "rc=$?"     # 期望：凭据 OK（来源 data/credentials.json），rc=0
+node muse-daemon.cjs --smoke; echo "rc=$?"     # 期望 0 + SMOKE OK
+stat -c '%a %n' data data/credentials.json     # 期望 700 / 600
+```
+
+### ⑤ 常见失败与处理
+
+| 现象 | 处理 |
+|---|---|
+| `凭据: 缺失 (无环境变量且无 credentials.json)` | 路径/文件名核对（不是 `.example`）；用 `node -e 'JSON.parse(...)'` 验 JSON |
+| `来源: 环境变量+文件混合（可能不完整）` | 只留一处完整的 |
+| `--smoke` 在 `confirm-password` 失败 | 密码错或账号有额外验证（见"已知边界"）；让用户浏览器登录确认账号可用 |
+| `token 403` | cookie 陈旧：删 `data/cookies.json` 重跑 `--smoke`；或出网没放行 `muse.ai` |
+| `sodium-native 未安装` | 回步骤 11 装依赖 |
+| 权限不是 600/700 | `chmod 700 data && chmod 600 data/credentials.json` |
+
+---
+
+## 十八、步骤 13：启动、停止
+
+**目标**：从演练到常驻，掌握停止/重启。**耗时**：5 分钟。
+**失败影响**：不启动就没有自动批准。
+
+> **顺序**：`--smoke`（真登录）→ `--once --dry`（连网关、只看不批）→ `--once`（真批一轮）→ 常驻（nohup）。
+> **默认参数**：不带参数就是 10 秒轮询 + `allow_always` + 失败回退 `allow_once`。策略 B 用 `--decision allow_once`。
+> **停止**：优雅停 `touch data/muse-daemon.stop`（≤10 秒退出，**保活不会拉起它**——维护模式）；前台 Ctrl+C；强杀 `kill "$(cat data/muse-daemon.pid)"`。
+> **防重复**：已在跑时再启动会打印 `another muse-daemon is already running: pid X -> exit` 并退出 0（设计，不是故障）。
+
+### ① AI 执行（命令）
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove; cd "$APP"
+export PATH="$HOME/.local/bin:$PATH"
+
+# 1) 演练：连网关、拉列表、只看不批
+node muse-daemon.cjs --once --dry; echo "rc=$?"
+tail -n 10 log/daemon-log.ndjson
+
+# 2) 常驻（后台）
+mkdir -p log
+nohup node muse-daemon.cjs --loop 10000 --always --fallback-once >> log/muse-console.log 2>&1 &
+echo "pid=$!"; sleep 8
+pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "在跑"
+tail -n 5 log/daemon-log.ndjson
+```
+
+期望日志依次出现 `daemon_start`（含 decision/scope/proxy）→ `connected` → `heartbeat`（每 10 秒一条，`pending` 为当前待批数）。`pending:0` 是常态，不是失败。
+
+**日常操作**：
+
+```bash
+pgrep -f "[m]use-daemon.cjs"                       # 查进程
+tail -f log/daemon-log.ndjson                      # 实时日志
+touch data/muse-daemon.stop                        # 优雅停（维护模式）
+rm data/muse-daemon.stop                           # 恢复
+kill "$(cat data/muse-daemon.pid)"                 # 强停（保活 1 分钟内拉回）
+cd "$APP" && node work/muse-rpc.cjs list           # 审批列表
+node work/muse-rpc.cjs detail '<id>'               # 单条详情
+```
+
+### ② 对用户说（可原样发送）
+
+> 启动分两步：先真登录验证一次（邮箱会收到一封验证码邮件，**不用管**），再做一次"只看不批"的演练；都过了我才挂后台。
+> 之后想停就跟我说（我放停止标记，保活也不会拉起它）。
+
+### ③ 用户手动做
+
+- 无。
+
+### ④ 做完的标志
+
+```bash
+cd ~/workspace/muse-guardian/MuseAutoApprove
+pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "在跑"
+tail -n 20 log/daemon-log.ndjson        # 期望 daemon_start → connected → heartbeat
+```
+
+### ⑤ 常见失败与处理
+
+| 现象 | 处理 |
+|---|---|
+| `connect_retry ... ENOENT ... cookies.json` 后紧跟 `auto_login_ok` | 正常自愈（首次无会话），不用管 |
+| `token 403` 反复 | 出网没放行 `muse.ai`，或 cookie 陈旧（删 `data/cookies.json` 重登） |
+| `fetch failed` / 连不上 | 出网没放行或网络不通；需代理才设 `MUSE_PROXY`（默认直连） |
+| 退出码 2 + 中文提示 | 无凭据无会话，回步骤 12 |
+| `another muse-daemon is already running` | 已有实例（pid 守卫）；重启先停 |
+| `DAEMON FATAL` | 看 console 日志里的具体错误；依赖缺失回步骤 11 |
+| 启动后没有 heartbeat | 看进程在不在；不在就回上一行 |
+
+---
+
+## 十九、步骤 14：保活（接进三层托管）
+
+**目标**：守护进程挂掉后 1 分钟内被看门狗拉起；沙盒重建后由恢复流程自动拉回。**耗时**：5 分钟（打两个补丁）。
+**失败影响**：不打补丁，它挂了就一直挂着（卡片重新开始弹），可能几天后才发现。
+
+> 守护进程自身有会话自愈（掉线重连、会话失效自动重登），**保活补丁只管一件事：进程不在就拉起**。接进两条既有通道：
+> 1. **Layer 1**：`watchdog.sh`（每分钟 cron）追加巡检段；
+> 2. **Layer 3**：`restore-all.sh`（重建恢复）追加启动段——开机钩子 `init.sh` 执行的就是 restore-all，所以**不用改 init.sh**。
+>
+> 两段都幂等：进程在就不动手；`data/muse-daemon.stop` 存在就跳过（维护模式）。
+
+### ① AI 执行（命令）
+
+**补丁 A：watchdog.sh**——在 `log "巡检完成"` 那一行**之前**插入：
+
+```bash
+# --- 4. MuseAutoApprove（muse.ai 外联审批自动批准）---
+# 策略：默认 A（永久允许）；用户选了 B 就把 --always --fallback-once 换成 --decision allow_once
+MUSE_APP="$HOME/workspace/muse-guardian/MuseAutoApprove"
+MUSE_DLOG="$MUSE_APP/log/daemon-log.ndjson"
+if [ -f "$MUSE_APP/muse-daemon.cjs" ] && [ ! -e "$MUSE_APP/data/muse-daemon.stop" ]; then
+  if pgrep -f "[m]use-daemon.cjs" >/dev/null 2>&1; then
+    # 可选加固：进程在但日志 15 分钟没动 → 判卡死，杀掉让下一轮重启
+    last_ts="$(tail -n 5 "$MUSE_DLOG" 2>/dev/null | grep -o '"ts":[0-9]*' | tail -1 | cut -d: -f2)"
+    if [ -n "$last_ts" ] && [ "$(( $(date +%s) * 1000 - last_ts ))" -gt 900000 ]; then
+      pid="$(cat "$MUSE_APP/data/muse-daemon.pid" 2>/dev/null || true)"
+      if [ -n "$pid" ] && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "[m]use-daemon.cjs"; then
+        kill -TERM "$pid" 2>/dev/null || true
+        log "MuseAutoApprove 日志停滞 15 分钟，已 TERM pid=$pid（下一轮重启）"
+      fi
+    fi
+  else
+    # 预检：无凭据且无有效会话时不白试（--check 0=可启动 / 2=不可）
+    if (cd "$MUSE_APP" && node muse-daemon.cjs --check >/dev/null 2>&1); then
+      mkdir -p "$MUSE_APP/log"
+      (cd "$MUSE_APP" && nohup node muse-daemon.cjs --loop 10000 --always --fallback-once >> log/muse-console.log 2>&1 &)
+      sleep 3
+      if pgrep -f "[m]use-daemon.cjs" >/dev/null 2>&1; then log "MuseAutoApprove 拉起成功"; else log "MuseAutoApprove 拉起失败（看 $MUSE_APP/log/muse-console.log）"; fi
+    else
+      log "MuseAutoApprove 预检未过（缺凭据且无有效会话），跳过"
+    fi
+  fi
+fi
+```
+
+插入与校验：
+
+```bash
+F=~/workspace/setup/watchdog.sh
+grep -q "MuseAutoApprove" "$F" && echo "补丁已在" || echo "未打补丁（按上面补丁 A 插入）"
+bash -n "$F" && echo "语法 OK"
+bash "$F"; echo "rc=$?"                    # 手动跑一次看门狗
+tail -n 5 ~/workspace/setup/logs/watchdog.log
+```
+
+**补丁 B：restore-all.sh**——在 `# --- 3. cf-probe 探针` 段之后、`# --- 4. cron 定时任务` 之前插入：
+
+```bash
+# --- 3b. MuseAutoApprove（重建后自动拉起）---
+MUSE_APP="$HOME/workspace/muse-guardian/MuseAutoApprove"
+if [ -f "$MUSE_APP/muse-daemon.cjs" ]; then
+  export PATH="$HOME/.local/bin:$PATH"
+  if ! command -v node >/dev/null 2>&1; then
+    log "WARN: node 不可用，MuseAutoApprove 无法启动。装好 Node 后看门狗会自动拉起。"
+  else
+    if ! (cd "$MUSE_APP" && node -e 'require("undici");require("ws");require("https-proxy-agent");require("sodium-native")' >/dev/null 2>&1); then
+      if [ -f "$HOME/workspace/setup/muse-node_modules.tar.gz" ]; then
+        log "解包离线依赖（muse-node_modules.tar.gz）"
+        tar -xzf "$HOME/workspace/setup/muse-node_modules.tar.gz" -C "$MUSE_APP" >>"$LOG" 2>&1 \
+          || log "WARN: 离线依赖解包失败"
+      else
+        log "尝试 npm install（无网时会失败）"
+        (cd "$MUSE_APP" && npm install --no-audit --no-fund >>"$LOG" 2>&1) || log "WARN: npm install 失败"
+      fi
+    fi
+    if [ ! -e "$MUSE_APP/data/muse-daemon.stop" ] && ! pgrep -f "[m]use-daemon.cjs" >/dev/null 2>&1; then
+      mkdir -p "$MUSE_APP/log"
+      (cd "$MUSE_APP" && nohup node muse-daemon.cjs --loop 10000 --always --fallback-once >> log/muse-console.log 2>&1 &)
+      sleep 3
+      pgrep -f "[m]use-daemon.cjs" >/dev/null 2>&1 && log "MuseAutoApprove 已启动" || log "WARN: MuseAutoApprove 启动失败"
+    else
+      log "MuseAutoApprove 已在运行或处于维护模式，跳过"
+    fi
+  fi
+else
+  log "未安装 MuseAutoApprove，跳过"
+fi
+```
+
+```bash
+F=~/workspace/setup/restore-all.sh
+grep -q "3b. MuseAutoApprove" "$F" && echo "补丁已在" || echo "未打补丁（按上面补丁 B 插入）"
+bash -n "$F" && echo "语法 OK"
+```
+
+**保活语义（四条，都实测过或按 Linux 语义成立）**：
+1. 进程在 → 静默跳过。
+2. 进程不在 + 预检过 → 拉起，3 秒后确认，失败记日志。
+3. 维护模式（stop 标记）→ 跳过，**不会跟用户抢**。
+4. 进程在但日志 15 分钟没动 → 判卡死，TERM 让下一轮重启（可选加固，补丁 A 里已含）。
+
+**注意**：restore-all 跑完最后会执行一次 watchdog，所以补丁 B 不用单独调 watchdog。开机钩子（init.sh）执行 restore-all，同理覆盖。
+
+**演练**（必做）：
+```bash
+kill "$(cat ~/workspace/muse-guardian/MuseAutoApprove/data/muse-daemon.pid)" 2>/dev/null
+sleep 70; pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "看门狗已拉回" || echo "没拉回：看 watchdog.log"
+```
+
+### ② 对用户说（可原样发送）
+
+> 自动审批接进你已有的保活了：**挂了 1 分钟内自动拉回**，沙盒重建后恢复脚本会把它带回来。
+> 有一个例外：如果放的是"停止标记"（维护模式），保活不会拉起它——这是故意的，否则你想停停不掉。
+> 我会做一次"杀掉→自动拉回"的实测。
+
+### ③ 用户手动做
+
+- 无。
+
+### ④ 做完的标志
+
+```bash
+grep -c MuseAutoApprove ~/workspace/setup/watchdog.sh          # ≥1
+grep -c "3b. MuseAutoApprove" ~/workspace/setup/restore-all.sh # 1
+tail -n 10 ~/workspace/setup/logs/watchdog.log                 # 能看到巡检记录
+pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "守护在跑"
+```
+
+### ⑤ 常见失败与处理
+
+| 现象 | 处理 |
+|---|---|
+| 杀掉后没被拉回 | `crontab -l \| grep watchdog` 确认看门狗在跑；检查 stop 标记是否忘了删 |
+| 拉起失败 | 看 `log/muse-console.log`；通常是凭据错（`auto_login_error`）或依赖缺失 |
+| 反复重启 | 同上；多为凭据失效，改密后要更新 `data/credentials.json` |
+| 重建后 `node: not found` | Node 装在系统目录了；按步骤 11 装 `$HOME/.local`（重建保留） |
+| 看门狗误杀自己的进程 | 确认用的是 `[m]use-daemon.cjs` 括号模式 |
+
+---
+
+## 二十、步骤 15：持久化与"换新沙盒"
+
+**目标**：不可再生的东西都放 `$HOME`；重建后零人工恢复。**耗时**：5 分钟。
+**失败影响**：凭据放环境变量里，重建后变成"没有凭据"——会话一旦过期就再也回不来，只能人工重配。
+
+**重建保留 vs 丢失**：
+
+| 东西 | 位置 | 重建后 |
+|---|---|---|
+| 代码 + `.git` + `node_modules` | `~/workspace/muse-guardian/` | **保留**（不必重装依赖） |
+| Node 运行时 | `~/.local/`（步骤 11 方案） | **保留** |
+| 凭据 | `…/data/credentials.json` | **保留**（会话失效后零人工重登的前提） |
+| 会话 | `…/data/cookies.json` | **保留**（30 天滚动；停机 ≤30 天都有效） |
+| vmId 缓存 / token 快照 | `…/data/muse-config.json`、`token-last.json` | **保留** |
+| 日志 | `…/log/` | **保留**（跨重建可回溯） |
+| 守护进程 | 内存 | **丢失** → restore-all 补丁拉回 |
+| apt 装的 node | `/usr` | **丢失**（所以推荐 $HOME 方案） |
+
+**重建后的恢复链路（自动，前提：补丁 B 已打）**：
+开机钩子/平台巡检 → `restore-all.sh` → 3b 段（Node 兜底 + 依赖兜底 + 拉起）→ 看门狗继续每分钟保活 → 会话若在 30 天窗口内直接复用（通常**不需要重新登录**）；过期则自动重登（发 1 封邮件）。
+
+**新沙盒迁移**（可选）：把 `~/workspace/muse-guardian/` 整目录（含 `data/`）打包带到新沙盒同位置解压，再跑一次 `muse-node.sh ensure`（Node 也要在 $HOME）即可——**凭据与 会话都在包里，等同账号，别外传**。
+
+**日志体积**：心跳每 10 秒一条，长期运行会积累。需要时：
+
+```bash
+cd ~/workspace/muse-guardian/MuseAutoApprove
+for f in log/*.ndjson log/*.log; do [ -f "$f" ] && tail -n 3000 "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done
+```
+（追加写入，mv 替换安全；介意的话先停守护。）
+
+### ① AI 执行（命令）
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove; cd "$APP"
+echo "--- 位置核对（都应在 $HOME 下）---"
+for p in . data log data/credentials.json data/cookies.json; do [ -e "$p" ] && echo "$p -> $(readlink -f "$p")"; done
+echo "--- 权限 ---"; stat -c '%a %n' data data/credentials.json data/cookies.json 2>/dev/null
+echo "--- 会话剩余 ---"; node muse-daemon.cjs --check | grep -E '凭据|会话'
+echo "--- 离线兜底 ---"; ls -lh ~/workspace/setup/*.tar.gz 2>/dev/null
+```
+
+### ② 对用户说（可原样发送）
+
+> 重建沙盒时：代码、依赖、账号配置、登录会话都在家目录里，**重建后不需要你做任何事**——恢复脚本会把进程拉起来，通常连验证码邮件都不用再发（会话没过期就直接续）。只有停机超过 30 天才会重新登录一次。
+> 唯一要留意的：换了 muse.ai 密码要告诉我更新凭据。
+
+### ③ 用户手动做
+
+- 改密后告知（我更新 `data/credentials.json` 并清会话重登）。
+
+### ④ 做完的标志
+
+```bash
+cd ~/workspace/muse-guardian/MuseAutoApprove
+readlink -f . data | grep -v "/home/hatch" || echo "都在 $HOME 下"
+stat -c '%a %n' data data/credentials.json
+node muse-daemon.cjs --check | tail -2
+```
+
+### ⑤ 常见失败与处理
+
+| 现象 | 处理 |
+|---|---|
+| 重建后 `node: not found` | Node 装在系统目录了：按步骤 11 装 `$HOME/.local`；或重装后跑 `muse-node.sh ensure` |
+| 重建后退出码 2（无凭据） | 凭据没走文件：回步骤 12 |
+| 停机超 30 天会话过期 | 有凭据文件就会自动重登（发 1 封邮件）；无需人工 |
+| 想彻底重置登录 | 删 `data/cookies.json`（可留 `muse-config.json`）→ `--smoke` |
+
+---
+
+## 二十一、步骤 16：验证是否可用
+
+**目标**：从"能加载"验到"真的替你批了单、且挂了能自愈"。**耗时**：10–15 分钟。
+**失败影响**：不验收，最坏是"看起来装了、其实一直在报错"，审批卡片照旧弹（或流程照旧卡）。
+
+> **五层验证**：静态 → 本地体检 → 登录链路 → 真实审批（核心）→ 韧性。每层都有判据，全绿才算可用。
+> **怎么制造一次真实审批**：让沙盒访问一个**没被永久放行过**的域名（如 `https://example.org`）。它会被平台拦下弹单，守护进程 10 秒内批准并落库永久规则。
+
+### ① AI 执行（命令）
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove; cd "$APP"; export PATH="$HOME/.local/bin:$PATH"
+
+echo "=== 1. 静态 ==="
+for f in muse-daemon.cjs work/*.cjs; do node --check "$f" >/dev/null || echo "FAIL $f"; done; echo "语法检查完成"
+node -e "require('undici');require('ws');require('https-proxy-agent');require('sodium-native');console.log('deps OK')"
+
+echo "=== 2. 本地体检（不出网）==="
+node muse-daemon.cjs --check; echo "rc=$?（期望 0）"
+
+echo "=== 3. 登录链路（会发 1 封邮件）==="
+node muse-daemon.cjs --smoke; echo "rc=$?（期望 0 + SMOKE OK）"
+
+echo "=== 4. 连接与轮询 ==="
+timeout 90 node muse-daemon.cjs --once --dry; echo "rc=$?（期望 0）"
+tail -n 5 log/daemon-log.ndjson        # 期望 connected + heartbeat
+
+echo "=== 5. 真实审批（核心）==="
+curl -sS -m 8 -o /dev/null -w 'first  HTTP %{http_code}\n' https://example.org || echo "被拦（正常：等批准）"
+sleep 12
+grep -E '"event":"(pending_found|decided|decided_fallback|decide_error)"' log/auto-approve-log.ndjson | tail -5
+curl -sS -m 8 -o /dev/null -w 'second HTTP %{http_code}\n' https://example.org   # 同域名第二次：不应再有新单
+
+echo "=== 6. 韧性：杀掉 → ≤70 秒自动拉回 ==="
+kill "$(cat data/muse-daemon.pid)" 2>/dev/null || true
+sleep 70
+pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "已自动拉回" || echo "没拉回：看 watchdog.log"
+```
+
+**判据（全绿才算可用）**：
+
+| # | 项 | 期望 |
+|---|---|---|
+| 1 | 静态 | 语法全过 + `deps OK` |
+| 2 | 体检 | rc=0，凭据/会话 OK |
+| 3 | 登录 | rc=0 + `SMOKE OK` |
+| 4 | 连接 | rc=0，日志有 `connected` + `heartbeat` |
+| 5 | 真实审批 | `pending_found` → `decided`；同域名第二次无新单 |
+| 6 | 韧性 | 杀掉后 ≤70 秒被拉回 |
+
+### ② 对用户说（可原样发送）
+
+> 验收四步：本地检查 → 真登录（邮箱会收到一封验证码邮件，**不用管**）→ 连网关拉列表 → **真实外联测试**：我让沙盒访问一个新网站，你在平台上看是不是不再弹卡片（或一闪而过），然后我再访问一次同一个网站——应该直接通过。
+> 结果我逐条报给你。若卡片一直挂着没人批，你点一次"允许"并告诉我，我查日志。
+
+### ③ 用户手动做
+
+- 观察平台 UI：第 5 步测试时卡片是否消失/一闪而过；反馈结果。
+
+### ④ 做完的标志
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove; cd "$APP"
+node muse-daemon.cjs --check | tail -2
+grep -c '"event":"decided"' log/daemon-log.ndjson                 # ≥1
+grep -E '"event":"(pending_found|decided)"' log/auto-approve-log.ndjson | tail -5
+pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "守护在跑"
+```
+
+### ⑤ 常见失败与处理
+
+| 现象 | 处理 |
+|---|---|
+| `--smoke` 失败在 `confirm-password` | 密码错或账号有额外验证（见"已知边界"）；核对密码后重试 |
+| `--once --dry` 报 `token 403` / `fetch failed` | 出网没放行 `muse.ai`；需代理才设 `MUSE_PROXY` |
+| 没有 `pending_found` | 测试域名已被放行过（换新域名）；或守护没在跑 |
+| 有 `pending_found` 没 `decided` | 看 `decide_error`；保守用 `--decision allow_once` 定位 |
+| 同域名第二次还弹单 | `decided` 里 `applied_rules` 为 0：scope 未被接受，看"已知边界" |
+| 杀掉后没拉回 | 补丁 B 没打 / 看门狗没跑 / stop 标记忘了删 |
+
+---
+
+## 二十二、步骤 17：故障排查（按症状查表）
+
+**目标**：出问题 5 分钟内定位。**耗时**：按需。
+
+> 排查顺序：**先看日志**（`daemon-log.ndjson` 主日志 / `muse-console.log` 后台输出 / `auto-approve-log.ndjson` 决策）→ 再看进程（`pgrep`）→ 最后看网络与凭据。别一上来就重启（会把现场清掉）。
+
+### ① AI 执行（命令）
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove
+pgrep -fa "[m]use-daemon.cjs" || echo "没在跑"
+tail -n 20 "$APP/log/daemon-log.ndjson"
+tail -n 20 "$APP/log/muse-console.log" 2>/dev/null
+tail -n 5  "$APP/log/auto-approve-log.ndjson" 2>/dev/null
+(cd "$APP" && node muse-daemon.cjs --check)
+ls -l "$APP/data/muse-daemon.stop" 2>/dev/null && echo "处于维护模式"
+```
+
+### ② 对用户说（可原样发送）
+
+> 出问题我来查，你只要告诉我现象（"卡片又弹了""它没在跑"之类），我给根因和修复动作，不需要你敲命令。
+
+### ③ 用户手动做
+
+- 描述现象；按要求放行域名或确认卡片。
+
+### ④ 做完的标志
+
+- 症状定位到下表某行，处理后复测通过。
+
+### ⑤ 常见失败与处理
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| `token 403`（连续） | 出网没放行 / cookie 陈旧 | 平台放行 `muse.ai`；删 `data/cookies.json` 重登 |
+| `fetch failed` / `ENOTFOUND` / `ECONNREFUSED` | 完全连不上 | 确认 `muse.ai` 可达；需代理才设 `MUSE_PROXY`（默认直连） |
+| `ENOENT ... cookies.json` 后紧跟 `auto_login_ok` | 正常自愈 | 不用管 |
+| `auto_login_error`（连续） | 凭据错/改密/二步验证 | 核对 `data/credentials.json`；二步验证不受支持 |
+| `sodium-native 未安装` / ABI 错误 | 依赖缺失或跨架构搬了 node_modules | 目标机重装依赖 |
+| `decide_error` 持续 | 服务端拒绝决策 | 看错误 message；保守用 `--decision allow_once` |
+| 日志 >15 分钟没动 | 进程僵死 | 看门狗会 TERM 并重启；也可手动 kill |
+| 磁盘被日志占满 | 长期累积 | 停进程后归档：`gzip log/daemon-log.ndjson` |
+
+## 二十三、步骤 18：跟用户的交互（话术与纪律）
+
+**目标**：固定协作套路：**问策略 → 收凭据 → 报安装 → 报验证**。健康时静默，只在需要用户动作时开口。
+
+> 四条纪律：
+> 1. **不猜策略**：装之前必须让用户选"永久允许 / 每次只批一次"。
+> 2. **不碰明文**：凭据只走"用户自己填文件"或"安全页面发给 AI、AI 落盘 600 后立刻从环境清除"；绝不进命令行参数、聊天、文档。
+> 3. **不报假成功**：验证要有日志证据（`decided`、`auto_login_ok`）；"进程在跑"不算数。
+> 4. **不擅自扩大范围**：不推荐 `deny_always`（会让沙盒对外请求全失败）；改策略先问用户。
+
+### ① AI 执行（命令）
+
+状态汇总一条命令（用于对用户汇报）：
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove
+{ echo "安装: $([ -f "$APP/muse-daemon.cjs" ] && echo 是 || echo 否)"
+  echo "守护进程: $(pgrep -f '[m]use-daemon.cjs' >/dev/null && echo 在跑 || echo 未运行)"
+  echo "维护模式: $([ -e "$APP/data/muse-daemon.stop" ] && echo 是 || echo 否)"
+  echo "累计批准: $(grep -c '"event":"decided"' "$APP/log/daemon-log.ndjson" 2>/dev/null || echo 0) 条"
+} | sed 's/^/  /'
+```
+
+### ② 对用户说（可原样发送）
+
+**开场（装之前，取得同意）**：
+
+> 装一个自动审批组件（MuseAutoApprove）：沙盒访问新域名时，它替你在 muse.ai 上自动点"允许"，不再需要人手点。默认策略是**永久允许**（同域名批一次就永久放行）。
+> 它需要你的 muse.ai 账号密码，可以你自己填文件（我不碰密码）。装的过程会弹一两次卡片（GitHub、npm），请手动点允许。
+> 你确认策略（A 永久允许 / B 每次只批一次），我就开始。
+
+**收凭据**：
+
+> 两种给法：A 你自己在沙盒里写文件 `data/credentials.json`（内容 `{"email":"...","password":"..."}`，`chmod 600`）；B 走安全页面发我，我落盘 600，聊天里不会出现密码。选一个。
+> 另外：登录时你邮箱会收到一封验证码邮件，**不用读、不用发给我**。
+
+**首次批准成功（可选通知）**：
+
+> 第一个新域名已自动放行，以后不再弹卡片。
+
+**失败通知（必须说，附下一步）**：
+
+> 自动审批连续失败，原因大概率是凭据失效（改密）或出网被拦。已停止自动重试，避免反复触发验证码邮件。处理方式：<具体动作>，弄好告诉我。
+
+**停用**：
+
+> 已停（维护模式）。审批卡片会恢复成"需要你手点"。想恢复随时说。
+
+### ③ 用户手动做
+
+- 按场景回复：确认策略 / 提供凭据 / 观察卡片 / 说停或恢复。
+
+### ④ 做完的标志
+
+- 四个固定动作（问策略、收凭据、报安装、报验证）都有用户确认或日志证据；用户知道怎么停。
+
+### ⑤ 常见失败与处理
+
+| 现象 | 处理 |
+|---|---|
+| 用户反问"会不会放行危险域名" | 复述：只对本账号审批流生效、放行范围就是被批的域名、不放心就选保守策略 |
+| 用户把密码发在聊天里 | 落盘 600 并提醒：这条消息含密码，建议改密；之后走安全页面 |
+| 用户说"卡片还在弹" | 按步骤 17 症状表排查，别直接说"应该好了" |
+| 用户误以为 `deny_always` 是安全开关 | 说明那会让沙盒对外请求全部失败 |
+
+---
+
+## 二十四、步骤 19：升级与卸载
+
+**目标**：升级不丢配置；下线能清干净。**耗时**：5 分钟。
+
+> 代码与数据分离：`work/` 是代码，`data/` 与 `log/` 是数据。升级只动代码，**不会让你重新登录、不丢决策记录**。
+
+### ① AI 执行（命令）
+
+**升级（保留 data/ 与 log/）**：
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove
+touch "$APP/data/muse-daemon.stop" && sleep 12          # 优雅停
+pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "还在跑，再等" || echo "已停"
+git -C ~/workspace/muse-guardian pull --ff-only
+cd "$APP" && npm install --no-audit --no-fund
+node -e "require('undici');require('ws');require('https-proxy-agent');require('sodium-native');console.log('deps OK')"
+for f in muse-daemon.cjs work/*.cjs; do node --check "$f" || echo "FAIL $f"; done; echo "语法检查完成"
+tar -czf ~/workspace/setup/muse-node_modules.tar.gz -C "$APP" node_modules   # 刷新离线兜底
+rm -f "$APP/data/muse-daemon.stop"
+# 恢复：等看门狗 1 分钟内拉起，或手动 nohup 启动
+```
+
+**卸载（分两档，删 data/ 前必须二次确认）**：
+
+```bash
+# 临时停（可逆）
+touch "$APP/data/muse-daemon.stop" && sleep 12
+# 彻底卸载（⚠️ 删 data/ 会丢凭据与会话）
+pgrep -f "[m]use-daemon.cjs" >/dev/null && kill "$(cat "$APP/data/muse-daemon.pid")" 2>/dev/null || true
+rm -rf "$APP/data" "$APP/log"
+# 代码目录按用户意愿删；并把 watchdog/restore-all 里的补丁段摘掉
+```
+
+### ② 对用户说（可原样发送）
+
+> - **升级**：我先停它、拉新代码、装依赖、自检、再启动。**账号配置和登录会话不受影响，不用重新登录**。
+> - **卸载**：分"临时停"和"彻底删（含账号配置）"两档，后者我需要你二次确认。
+
+### ③ 用户手动做
+
+- 升级：无。卸载：选档并二次确认。
+
+### ④ 做完的标志
+
+```bash
+APP=~/workspace/muse-guardian/MuseAutoApprove
+git -C ~/workspace/muse-guardian log --oneline -1
+(cd "$APP" && node muse-daemon.cjs --check); echo "rc=$?"
+pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "新版在跑"
+# 卸载后
+ls -d "$APP/data" 2>/dev/null || echo "data/ 已删除"
+```
+
+### ⑤ 常见失败与处理
+
+| 现象 | 处理 |
+|---|---|
+| `git pull` 报本地改动冲突 | `git status` 看改了什么；重要就 `git stash`，否则 `git checkout -- <file>` 后重试 |
+| 升级后起不来 | Node 版本 / 依赖变化：`node -v`、`deps OK` 复查 |
+| 升级后要重新登录 | `data/` 被误删（如 `git clean -xdf`）：重新配凭据 |
+| 卸载后看门狗一直报拉起失败 | 补丁里的存在性判断坏了：确认 `[ -f ... ] || 跳过` 那行在 |
+| 卸载后忘了清离线包 | 可留（重建有用）；要清：`rm -f ~/workspace/setup/muse-*.tar.gz` |
+## 二十五、步骤 20：最终验证清单 + 端到端重建演练
+
+**目标**：确认整条链路真的通了，并且"重建"这条路走过一遍。**耗时**：验证 5 分钟；演练约 3 分钟（含 2 分钟中断）。
+
+### ① AI 执行（命令）
+
+```bash
+echo "=== 1. 健康检查 ==="
+bash ~/workspace/setup/health-check.sh; echo "退出码=$?（期望 0）"
+
+echo "=== 2. 沙盒内看门狗 cron ==="
+crontab -l | grep watchdog
+
+echo "=== 3. 探针 ==="
+systemctl is-active cf-probe
+journalctl -u cf-probe -n 3 --no-pager -o cat | tail -3
+
+echo "=== 4. 微信网关 ==="
+pgrep -f "[g]ateway run" >/dev/null && echo "网关运行中"
+grep -c '^WEIXIN_TOKEN=' ~/.hermes/.env
+
+echo "=== 5. 平台定时任务 ==="
+ls ~/workspace/goals/goal/crons/minutely/ 2>/dev/null | grep keepalive || echo "（该平台无此目录，用平台任务列表核对）"
+
+echo "=== 6. 开机钩子 ==="
+jq -e '.enabled == true' /home/hatch/hooks/definitions/home-init.json >/dev/null && echo "钩子已启用"
+ls -l /home/hatch/init.sh | grep -q '^-rwx------' && echo "init.sh 权限 700"
+
+echo "=== 7. 离线缓存 ==="
+ls ~/workspace/setup/deb-cache/*.deb | wc -l
+ls -l ~/workspace/setup/cf-probe-linux-amd64
+
+echo "=== 8. 备份 ==="
+cat ~/workspace/backups/hermes-home/.last-success 2>/dev/null || echo "还没做过备份（跑一次 backup-hermes.sh）"
+
+echo "=== 9. MuseAutoApprove（外联审批自动批准） ==="
+pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "守护进程在跑" || echo "未运行（按第 17 步的验收表排查）"
+tail -n 3 ~/workspace/muse-guardian/MuseAutoApprove/log/auto-approve-log.ndjson 2>/dev/null || echo "（还没有决策记录，让沙盒访问一个新域名试一次）"
+```
+
+**备份一次**（把当前来之不易的配置固定下来）：
+
+```bash
+bash ~/workspace/setup/backup-hermes.sh; echo "rc=$?"     # 期望 0
+cat ~/workspace/backups/hermes-home/.last-success
+du -sh ~/workspace/backups/hermes-home
+```
+
+### ② 对用户说（可原样发送）
+
+> 都装好了，最后两步：
+>
+> 1. **请你用微信给机器人发一条"你好"**，看它回不回复——回复了就说明全链路通了。
+> 2. 要不要做一次**完整重建演练**？我会真跑一遍 `restore-all.sh`：微信网关会中断约 2 分钟，探针会短暂掉线，其他不受影响。跑完我把恢复耗时和每一步结果给你看。（建议做，这样"重建能恢复"就不是推测而是实测。）
+
+### ③ 用户手动做
+
+- 微信发消息测试。
+- 决定是否做重建演练（做的话在旁边看着就行）。
+
+### ④ 做完的标志
+
+- 9 项检查全部符合期望（尤其 `health-check.sh` 退出码 0、微信有回复、MuseAutoApprove 守护进程在跑）。
+- 演练（若做）：`restore.log` 里从 `===== 开始恢复 =====` 到 `恢复结束` 有完整时间戳，恢复后重跑验证清单仍全绿，微信恢复对话。
+
+```bash
+grep -E '开始恢复|恢复结束' ~/workspace/setup/logs/restore.log | tail -4
+bash ~/workspace/setup/health-check.sh; echo "演练后退出码=$?（期望 0）"
+```
+
+### ⑤ 常见失败与处理
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 演练后微信不回 | 网关没起来 / state.db 异常 | `tail -50 ~/.hermes/logs/weixin-gateway.log`；`bash ~/workspace/setup/restore-hermes.sh` 再跑一次 |
+| 演练后探针掉线不回来 | 探针安装失败（网络/缓存） | 看 `logs/probe-install.log`；`bash ~/workspace/setup/cache-cf-probe-bin.sh` 补缓存后重跑启动器 |
+| 恢复日志里 `WARN hermes 恢复失败` | installer 下载失败且无缓存 | 联网重跑；确认 `~/workspace/setup/hermes-install.sh` 存在 |
+| `health-check.sh` 一直返回 1 | 有服务确实没起来 | 按输出里的 `failed: xxx` 逐个查 |
+
+## 二十六、运维手册（装完之后日常要用到的）
+
+```bash
+# 查健康 / 手动恢复
+bash ~/workspace/setup/health-check.sh; echo $?      # 0=健康 1=需恢复
+bash ~/workspace/setup/restore-all.sh                # 幂等，可随时跑
+tail -f ~/workspace/setup/logs/restore.log
+tail -f ~/workspace/setup/logs/watchdog.log
+
+# 备份（手动，别加 cron）
+bash ~/workspace/setup/backup-hermes.sh; echo $?     # 0=成功；非 0=这次作废，上一份备份仍在
+cat ~/workspace/backups/hermes-home/.last-success    # 最后一次成功的时间
+
+# 探针
+systemctl status cf-probe --no-pager | head -5
+journalctl -u cf-probe -f
+bash ~/workspace/setup/run-probe-install.sh          # 重装探针（务必走启动器）
+bash ~/workspace/setup/cache-cf-probe-bin.sh         # 刷新二进制缓存
+
+# Hermes / 微信
+pgrep -f "[g]ateway run" && echo 网关在跑
+tail -f ~/.hermes/logs/weixin-gateway.log
+hermes send --to weixin:<chat_id> "测试消息"          # 回合外主动发消息（需 .env 里有 WEIXIN_TOKEN）
+
+# MuseAutoApprove（muse.ai 外联审批自动批准）
+APP=~/workspace/muse-guardian/MuseAutoApprove
+pgrep -f "[m]use-daemon.cjs" >/dev/null && echo "自动审批在跑" || echo "自动审批未在跑（看门狗会在一分钟内拉起）"
+tail -f "$APP/log/daemon-log.ndjson"                   # 主日志：心跳 / 审批 / 自愈事件
+(cd "$APP" && node work/muse-rpc.cjs list)             # 手动看审批列表
+touch "$APP/data/muse-daemon.stop"                     # 维护模式：停掉，且保活不再拉起
+rm -f "$APP/data/muse-daemon.stop"                     # 退出维护模式（看门狗下一分钟自动拉起）
+
+# 离线包刷新（换内核/换镜像后重做一次）
+# 见步骤 3 的 A 段命令
+```
+
+**密钥轮换（上游明确要求：改 API_SECRET 后需要重新部署 Worker + 所有服务器重装 Agent）**
+
+1. CF 后台 → Worker → Variables and Secrets → 改 `API_SECRET`（保存并等重新部署）。
+2. 本机：`install-cf-probe.sh` 里的 `-secret='<API_SECRET>'` 改成新值（600 权限不变）。
+3. 重装探针：`bash ~/workspace/setup/run-probe-install.sh`。
+4. 后台「服务器管理」里确认这台机器恢复在线（改密钥那段时间它会先离线）。
+5. 后台管理员密码如果和 `API_SECRET` 一致，登录后一并改掉。
+
+**卸载探针**：`sh ~/workspace/setup/cf-probe-install.saved.sh uninstall`（或直接用缓存二进制 `./cf-probe-linux-amd64 uninstall`）。
+
+## 二十七、铁律（血泪教训，违反必出事）
+
+1. **绝不在网关运行时覆盖 `~/.hermes/` 里的数据文件。** `state.db` 一旦被换掉，运行中的网关会抛 `StateDbReplacedError` 并**拒绝一切写入**——症状是"能收消息、完全回不了"，而且看起来像网络问题。要动数据就先停网关（本手册的 `restore-hermes.sh` 只在真正需要时才停，且只在健康时跳过 installer）。
+2. **SQLite 必须用 `sqlite3 .backup` 在线热备，且失败要 fail closed。** `~/.hermes` 里有三个 WAL 活库（`state.db`、`kanban.db`、`shared-state.db`）；裸 `cp`/`rsync` 复制会撕裂（压测单轮最多静默丢 38000 行），而 `PRAGMA integrity_check` 对撕裂备份**照样返回 ok**——不要用 `integrity_check` 当验收手段。热备失败时**不要**回退到 cp，旧备份比"看起来新的坏备份"值钱。
+3. **探针安装必须走 `run-probe-install.sh`。** 安装器按 cmdline 关键字清理进程，直接跑会把调用者自己的 shell 杀掉。
+4. **判断微信账号存在用 `compgen -G`，不要用 `[ -f dir/*.json ]`。** 后者在 glob 展开成多个文件时直接报 `too many arguments`、分支恒为假，症状就是"重建后网关起不来"。
+5. **`gateway.pid` 是 JSON，不是裸数字。** 想按 pid 精确 kill 就老老实实解析（`jq -r .pid` 或 python），别 `cat` 出来当数字用——否则那个分支永远命中不了，你以为在精确 kill，其实一直在走兜底。
+6. **密钥四条铁律**（重复一遍，因为最容易犯）：真实密钥绝不进文档/记忆/日志；优先让用户自己生成、走安全页面；**先脱敏再打印**（或干脆不打印，只输出计数/长度/路径）；含密钥文件一律 600，不要用文件读取工具打开。
+7. **备份脚本不要加进 cron。** 它读三个活库；手动/按需跑即可。
+8. **HEALTH CHECK 的退出码就是契约**：0 健康静默、1 需恢复、2 环境异常跳过。平台任务/看门狗都依赖它，改脚本时不要改变语义。
+9. **看门狗/巡检里杀进程要避开自己**：`pgrep -f "[g]ateway run"` 用中括号，枚举后排除 `$$` 和 `$PPID`，不要 `pkill -f` 一把梭（命令行里出现过关键字的东西会被一起杀掉，包括调用者）。
+10. **本手册不含任何真实密钥、域名、IP。** 所有敏感值都是占位符：`<PROBE_ID>`、`<API_SECRET>`、`<WORKER_URL>`、`<API_BASE_URL>`、`<MODEL_NAME>`。部署时替换，替换后文件权限 600，并且**不要**把替换过的文件复制进任何文档/仓库。
+
+11. **MuseAutoApprove 的凭据只走两条路**：用户自己填 `data/credentials.json`（600），或用户经安全页面发给 AI、AI 落盘后**立刻从环境清除**。绝不写进命令行参数（`ps` 可见）、不回显、不复述、不进文档。详见第十七章。
+12. **装 MuseAutoApprove 前必须让用户选策略**：默认 `allow_always`（永久放行）意味着"以后这个域名的外联不再问用户"。没有用户明确同意不要装；想保守就用 `--decision allow_once`。`deny_always` 不是"更安全的开关"——它会让沙盒对外请求全部失败。
+13. **不要对 app 目录用 `git clean -x` / `git clean -xdf`**：`data/`（凭据、会话）与 `log/` 都在 `.gitignore` 里，`-x` 会把它们当垃圾删掉，结果是"升级完要重新登录"。
+
+## 二十八、已知边界与待验证项（诚实清单）
+
+这几条是部署时**需要现场确认**、不要照抄结论的地方：
+
+1. **`npx wrangler deploy` 是否能自动建 D1 库**：上游 README 的三条官方路径里都没写"先 `wrangler d1 create`"（绑定在 `wrangler.toml` 里声明了库名 `server-monitor-db`），但本地/CI 部署时通常需要库已存在。本手册的做法是**先查再建**（`d1 list` / `d1 create`，已存在会报错就忽略），三种情况下都不会错。**待在新账号上实测一次**：干净账号只跑 `npm run build:frontend && npx wrangler deploy` 会发生什么。
+2. **CF 后台「添加服务器」生成的安装命令里带了 `-ct / -cu / -cm` 网络质量节点**（中国大陆三网节点，第三方域名）。本手册的模板把这些做成可选占位符（留空即用 agent 内置节点）；**照抄后台命令**是最稳的做法。
+3. **Worker 的 Cron 触发器 / Durable Object 行为**：`wrangler.toml` 里声明了 `*/1 * * * *` 与 `0 * * * *` 两个 cron 和 `MetricsBroadcaster` DO；首次部署会自动创建 DO namespace（配置注释如此说）。上线后建议看一眼 Worker 的 Cron 日志确认定时任务在跑。
+4. **`weixin-qr-*.py` 用的是 iLink 的非公开接口**（`ilinkai.weixin.qq.com` 的 `ilink/bot/*`）。接口可能变更；脚本失败时先看返回体，再考虑是否需要调整参数（`bot_type=3`、App Id `bot`、客户端版本打包值）。
+5. **平台侧的定时任务/开机钩子接口随平台版本变化**：本手册给的是 Muse/hatch 上的实测形态（任务定义落盘在 `~/workspace/goals/goal/crons/minutely/`，钩子定义在 `/home/hatch/hooks/definitions/`）。换平台时要重新确认"任务怎么建""钩子注册格式""开机命令叫什么"。
+6. **MuseAutoApprove 的自动登录假设"纯密码登录"**：服务端流程是 restart → send-otp（发验证码邮件）→ confirm-password（密码信封），**全程不读邮件**。若账号开了二步验证 / 新设备确认，`--smoke` 会失败——属于设计边界，需要现场确认账号策略（见第十七章 ⑤）。
+7. **审批接口是逆向复刻的**：`egress.approvals` / `egress.approval.decide` 的请求形状来自对 muse.ai 网页客户端的抓包复刻，平台改版后会失效。症状：`rpc error`、决策字段不被识别、握手超时。处理：回仓库拉最新代码覆盖 `work/`（保留 `data/`），并把报错原文记录下来。
+8. **日志尚未完全脱敏**：登录成功时日志会记下 `hatch_sess` 的前 36 个字符（UUID 形态，等价于完整会话值），`data/token-last.json` 含完整 JWT。所以 `log/` 与 `data/` 同级敏感——不要外发、不要贴群、不要提交。（改进方向：给登录日志做一次脱敏改造。）
+9. **`allow_always` 的作用域边界未实测**：`destination_domain` 对子域（`a.example.com` vs `b.example.com`）与端口是否全覆盖，需要用一次"牺牲域名"实测（第 16 步验收顺手做，别拿重要域名试）。
+10. **reader grant 类审批的永久 scope 是 `entity`** 而非 `destination_domain`：本工具默认 scope 对这类单不适用，会回退 `allow_once`；需要永久放行时改用 `--scope entity` 并实测。
+11. **同一账号只在一处跑守护**：多处同时跑会重复轮询同一批审批单——先批的生效，后批的记 `decide_error`（无害但吵）。多沙盒场景要么各配各的账号，要么用 `MUSE_VM_ID` 明确分工。
