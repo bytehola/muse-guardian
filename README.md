@@ -2,13 +2,17 @@
 
 给 Muse.ai 沙盒装上探针、Hermes、保活和重建脚本，以及 **MuseAutoApprove**（自动允许审批）的 SKILL。
 
-**10亿Token邀请码：ZMASLD**
 
 ## 使用
 
+
 ```
-帮我安装 `https://raw.githubusercontent.com/bytehola/muse-guardian/refs/heads/main/SKILL.md`。
+帮我安装 `https://raw.githubusercontent.com/bytehola/muse-guardian/refs/heads/main/SKILL.md`并开始执行。
 ```
+
+如遇拦截，打开侧边栏点击新旁路会话发送。
+
+---
 
 安装后 Agent 会按手册步骤部署以下组件：
 
@@ -26,3 +30,7 @@
 
 # 友好社区
 [LinuxDo](https://linux.do/)
+
+#
+
+我的邀请码：ZMASLD，有需要可以使用，谢谢。
