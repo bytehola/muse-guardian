@@ -30,7 +30,3 @@
 
 # 友好社区
 [LinuxDo](https://linux.do/)
-
-#
-
-我的邀请码：ZMASLD，有需要可以使用，谢谢。

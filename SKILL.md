@@ -1,7 +1,7 @@
 ---
 name: muse-guardian
 description: "在全新沙盒/新账号上从零部署一套「CF Server Monitor 探针 + 三层保活 + Hermes 微信机器人 + MuseAutoApprove（muse.ai 外联审批自动批准）」：Cloudflare Worker 后台、cf-probe 探针、持久化脚本布局、离线包缓存、Hermes 安装与模型 API 配置、微信扫码绑定、沙盒内看门狗、平台定时巡检、平台开机钩子、端到端验证。开工先问「全部安装 / 逐模块」（默认逐模块）；全文按 5 个模块 + 收尾组织，同一模块内连续执行，只在用户必须输入/扫码/平台点击时打断；每步五段式（命令 / 话术 / 用户手动动作 / 做完的标志 / 排错表格），全部脚本完整代码直接内嵌，复制即可用。触发词：部署保活、给新账号也来一套、装探针、微信机器人、沙盒重建恢复、保活脚本、自动审批、审批卡片、MuseAutoApprove。"
-version: 2.5.0
+version: 2.5.1
 license: MIT
 metadata:
   hermes:
@@ -998,7 +998,7 @@ fi
 # 只查进程查不出微信 poll 卡死，看日志里 poll error 是否持续超过 5 分钟。
 WXLOG="$HOME/.hermes/logs/weixin-gateway.log"
 WX_RESTART_TS="$SETUP_DIR/.wx-wedged-restart-ts"
-if pgrep -f "[g]ateway run" >/dev/null 2>&1 && [ -f "$WXLOG" ]; then
+if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1 && [ -f "$WXLOG" ]; then
   since="$(date -d '10 minutes ago' '+%F %T')"
   mapfile -t wxerrs < <(awk -v since="$since" \
     'index($0,"poll error")>0 && substr($0,1,19)>=since {print substr($0,1,19)}' "$WXLOG" 2>/dev/null)
@@ -1011,9 +1011,9 @@ if pgrep -f "[g]ateway run" >/dev/null 2>&1 && [ -f "$WXLOG" ]; then
       if [ "$((now - last_restart))" -ge 900 ]; then
         log "微信 poll 持续报错超过 5 分钟（$first_ts ~ $last_ts），判定连接卡死，重启网关"
         # 精确 kill：优先 gateway.pid。注意该文件是 JSON（{"pid":123,"kind":"hermes-gateway",...}），
-        # 不能直接 cat 当数字用；解析出 pid 后还要校验 /proc/<pid>/cmdline 命中 `gateway run`。
+        # 不能直接 cat 当数字用；解析出 pid 后还要校验 /proc/<pid>/cmdline 命中网关进程模式（hermes-agent.*[g]ateway）。
         # 拿不到有效 pid 才枚举 pgrep 命中进程，并排除自身与父进程——
-        # 不用 `pkill -f`：一行命令里出现过 `gateway run` 字样（比如包装它的 bash -c）也会被误杀。
+        # 不用 `pkill -f`：一行命令里出现过网关关键字（比如包装它的 bash -c）也会被误杀。
         killed=0
         gpid=""
         if [ -f "$HOME/.hermes/gateway.pid" ]; then
@@ -1025,7 +1025,7 @@ if pgrep -f "[g]ateway run" >/dev/null 2>&1 && [ -f "$WXLOG" ]; then
               "$HOME/.hermes/gateway.pid" 2>/dev/null || true)"
           fi
           if [ -n "$gpid" ] && [ -f "/proc/$gpid/cmdline" ] \
-             && tr '\0' ' ' < "/proc/$gpid/cmdline" 2>/dev/null | grep -q "[g]ateway run"; then
+             && tr '\0' ' ' < "/proc/$gpid/cmdline" 2>/dev/null | grep -q "hermes-agent.*[g]ateway"; then
             kill -TERM "$gpid" 2>/dev/null && killed=1
             for _ in 1 2 3 4 5 6 7 8 9 10; do
               kill -0 "$gpid" 2>/dev/null || break
@@ -1038,7 +1038,7 @@ if pgrep -f "[g]ateway run" >/dev/null 2>&1 && [ -f "$WXLOG" ]; then
           fi
         fi
         if [ "$killed" = 0 ]; then
-          for p in $(pgrep -f "[g]ateway run" 2>/dev/null); do
+          for p in $(pgrep -f "hermes-agent.*[g]ateway" 2>/dev/null); do
             [ "$p" = "$$" ] && continue
             [ "$p" = "$PPID" ] && continue
             kill -TERM "$p" 2>/dev/null || true
@@ -1055,14 +1055,14 @@ if pgrep -f "[g]ateway run" >/dev/null 2>&1 && [ -f "$WXLOG" ]; then
 fi
 
 # --- 2b. hermes 微信网关：进程缺失则重启 ---
-# 进程行是 bash -c 包装器 "... && hermes gateway run > log 2>&1"，用 [g] 避免自匹配
-if ! pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+# 进程行有新老两种形态：`hermes gateway run` 与 `python3 -I -c` 包装（cmdline 里是 hermes-agent 路径）。统一用 hermes-agent.*[g]ateway 检测，两种都能命中；[g] 避免自匹配。
+if ! pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
   log "hermes gateway 进程丢失，尝试重启"
   if compgen -G "$HOME/.hermes/weixin/accounts/*.json" > /dev/null 2>&1; then
     mkdir -p "$HOME/.hermes/logs"
     nohup hermes gateway run >> "$HOME/.hermes/logs/weixin-gateway.log" 2>&1 &
     sleep 3
-    if pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+    if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
       log "hermes gateway 重启成功"
     else
       log "hermes gateway 重启后仍无进程"
@@ -1134,7 +1134,7 @@ failures=""
 if [ "$(systemctl is-active cf-probe 2>/dev/null)" != "active" ]; then
   failures="$failures cf-probe"
 fi
-if ! pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+if ! pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
   failures="$failures hermes-gateway"
 fi
 if ! pgrep -f "[/]usr/sbin/sshd" >/dev/null 2>&1; then
@@ -1308,7 +1308,7 @@ echo "OK: 恢复流程结束，详见 $LOG"
 #     所以：hermes 可用 且 数据完好 → 什么都不做，只确保网关在跑。
 #  2. 真正要动东西（缺 hermes / 缺数据）时，先【安全停网关】再动手，做完重新启动。
 #     停网关优先用 gateway.pid 里的 pid（该文件是 JSON，不是裸数字），
-#     校验 /proc/<pid>/cmdline 命中 `gateway run` 才 kill；拿不到就枚举
+#     校验 /proc/<pid>/cmdline 命中网关进程模式（hermes-agent.*[g]ateway）才 kill；拿不到就枚举
 #     pgrep 命中的进程（排除自身与父进程），绝不用 `pkill -f` 一把梭。
 #  3. 账号判断必须用 `compgen -G`：`[ -f dir/*.json ]` 在匹配到多个文件时
 #     报 "too many arguments" 恒为假，症状就是"重建后网关起不来"。
@@ -1350,7 +1350,7 @@ stop_gateway() {
   ppid_="$PPID"
   pid="$(gateway_pid)"
   if [ -n "$pid" ] && [ -f "/proc/$pid/cmdline" ] \
-     && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "[g]ateway run"; then
+     && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "hermes-agent.*[g]ateway"; then
     log "按 gateway.pid 精确停网关 pid=$pid"
     kill -TERM "$pid" 2>/dev/null || true
     waited=0
@@ -1369,7 +1369,7 @@ stop_gateway() {
   fi
   # pidfile 不可用：枚举命中进程（排除自身和父进程，避免误杀调用者）
   pids=""
-  for p in $(pgrep -f "[g]ateway run" 2>/dev/null || true); do
+  for p in $(pgrep -f "hermes-agent.*[g]ateway" 2>/dev/null || true); do
     [ "$p" = "$mypid" ] && continue
     [ "$p" = "$ppid_" ] && continue
     pids="$pids $p"
@@ -1401,7 +1401,7 @@ stop_gateway() {
 
 # --- 启动网关：没在跑才启动（避免双实例） ---
 start_gateway_if_needed() {
-  if pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+  if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
     log "微信网关已在运行，无需启动"
     return 0
   fi
@@ -1409,7 +1409,7 @@ start_gateway_if_needed() {
     mkdir -p "$HOME/.hermes/logs"
     nohup hermes gateway run >> "$GWLOG" 2>&1 &
     sleep 3
-    if pgrep -f "[g]ateway run" >/dev/null 2>&1; then
+    if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
       log "微信网关已启动"
       return 0
     fi
@@ -1471,7 +1471,7 @@ if [ -f "$HOME/.hermes/config.yaml" ] && [ -f "$HOME/.hermes/state.db" ]; then
   data_ok=1
 fi
 gw_running=0
-pgrep -f "[g]ateway run" >/dev/null 2>&1 && gw_running=1
+pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1 && gw_running=1
 log "检查：hermes_ok=$hermes_ok data_ok=$data_ok gateway_running=$gw_running"
 
 if [ "$hermes_ok" = 1 ] && [ "$data_ok" = 1 ]; then
@@ -1759,8 +1759,6 @@ grep -c '^MY_API_KEY=' ~/.hermes/.env            # 期望 1
 awk -F= '/^MY_API_KEY=/{print "MY_API_KEY 长度: " length($2)}' ~/.hermes/.env
 ```
 
-**临时 Key 的处理**：如果用户说"这是临时测试用的"，验证通过后**立即**从 `.env` 删除并告知用户（`sed -i '/^MY_API_KEY=/d' ~/.hermes/.env`，或让用户自己决定是否长期保留）。
-
 **连通性自检**（推荐做，避免"装好了但一问就报错"）：
 
 ```bash
@@ -1775,15 +1773,11 @@ hermes --non-interactive "只回复两个字：在线" 2>&1 | tail -5
 > 2. **API Key**：**走安全页面**发我，别贴在聊天里。
 > 3. **模型名**：你那个接口上要用的模型标识（比如 `deepseek-v4.1-flash` 这类）。
 >
-> 另外确认一句：这个 Key 是**长期使用**还是**临时测试**？
->
-> - 长期 → 我写到 `~/.hermes/.env`（600 权限，只有本机能读）；
-> - 临时 → 验证通过后我立刻删掉，不留痕迹。
+> - 我写到 `~/.hermes/.env`（600 权限，只有本机能读）；
 
 ### ③ 🙋 用户手动做
 
 - 通过安全页面提供 API 地址与 Key；提供模型名。
-- 说明 Key 是长期还是临时。
 
 ### ④ ✅ 做完的标志
 
@@ -1799,13 +1793,13 @@ hermes --non-interactive "只回复两个字：在线" 2>&1 | tail -3   # 期望
 
 ### ⑤ 🛠️ 常见失败与处理
 
-| 现象                           | 原因                                        | 处理                                                                                        |
-| ------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `hermes: command not found`    | `~/.local/bin` 不在 PATH                    | `export PATH="$HOME/.local/bin:$PATH"`；网关用 `nohup hermes gateway run` 启动时会自带 PATH |
-| 调用报 401/403                 | Key 错、过期或没写进 `.env`                 | `grep -c '^MY_API_KEY=' ~/.hermes/.env`；值不要带引号                                       |
-| 调用超时                       | 地址端口不通                                | 让用户确认地址可从沙盒访问（`curl -m 8 <API_BASE_URL>/models`）；国内机房注意出网策略       |
-| installer 反复重装、把网关搞挂 | installer 无条件跑会动 state.db | 用本手册的 `restore-hermes.sh`：健康时跳过 installer，需要时才停网关                     |
-| `.env` 权限变成 644            | 复制/编辑时改了权限                         | `chmod 600 ~/.hermes/.env`（里面是所有密钥）                                                |
+| 现象                           | 原因                            | 处理                                                                                        |
+| ------------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------- |
+| `hermes: command not found`    | `~/.local/bin` 不在 PATH        | `export PATH="$HOME/.local/bin:$PATH"`；网关用 `nohup hermes gateway run` 启动时会自带 PATH |
+| 调用报 401/403                 | Key 错、过期或没写进 `.env`     | `grep -c '^MY_API_KEY=' ~/.hermes/.env`；值不要带引号                                       |
+| 调用超时                       | 地址端口不通                    | 让用户确认地址可从沙盒访问（`curl -m 8 <API_BASE_URL>/models`）；国内机房注意出网策略       |
+| installer 反复重装、把网关搞挂 | installer 无条件跑会动 state.db | 用本手册的 `restore-hermes.sh`：健康时跳过 installer，需要时才停网关                        |
+| `.env` 权限变成 644            | 复制/编辑时改了权限             | `chmod 600 ~/.hermes/.env`（里面是所有密钥）                                                |
 
 ## 十三、步骤 10：绑定微信（扫码登录）
 
@@ -1858,7 +1852,7 @@ chmod 600 ~/.hermes/.env
 # 6. 启动网关（后台常驻）
 mkdir -p ~/.hermes/logs
 nohup hermes gateway run >> ~/.hermes/logs/weixin-gateway.log 2>&1 &
-sleep 3; pgrep -f "[g]ateway run" >/dev/null && echo "网关已启动"
+sleep 3; pgrep -f "hermes-agent.*[g]ateway" >/dev/null && echo "网关已启动"
 
 # 7. 批准配对（关键一步，别漏）：让用户先在微信里给机器人发一条消息，
 #    机器人回一个 8 位配对码（形如 3TNTE7PR）而不是内容——这是 Hermes 的 DM 配对安全机制。
@@ -1901,7 +1895,7 @@ hermes pairing list
 ```bash
 compgen -G "$HOME/.hermes/weixin/accounts/*.json" >/dev/null && echo "账号已绑定"
 python3 -c "import glob,os;print([os.path.basename(p) for p in glob.glob(os.path.expanduser('~/.hermes/weixin/accounts/*.json'))])"
-pgrep -f "[g]ateway run" >/dev/null && echo "网关运行中"
+pgrep -f "hermes-agent.*[g]ateway" >/dev/null && echo "网关运行中"
 grep -c '^WEIXIN_TOKEN=' ~/.hermes/.env     # 期望 1（只数条数，不看值）
 hermes pairing list                          # 期望：用户已在「已批准」列表里
 ```
@@ -2176,12 +2170,12 @@ ls -l /home/hatch/init.sh 2>/dev/null || echo "init.sh 尚未创建（步骤 14 
 > **2. 允许注册开机钩子**：我要注册一个开机钩子（`home-init`），沙盒每次启动自动跑一次恢复。有权限提示请允许。
 > **3. 允许开机命令以 root 执行**：钩子入口 `init.sh` 需要 root 权限（chmod 700），它要装系统包、写 systemd、起 sshd。平台提示权限申请时请批准。
 >
-> 三项都确认后跟我说"授权好了"。
+> 三项都确认后跟我说"同意继续"。
 
 ### ③ 🙋 用户手动做
 
 - 在平台端批准上面三项（定时任务 / 开机钩子 / root 执行）。
-- 回复"授权好了"。
+- 回复"同意继续"。
 
 ### ④ ✅ 做完的标志
 
@@ -2189,7 +2183,7 @@ ls -l /home/hatch/init.sh 2>/dev/null || echo "init.sh 尚未创建（步骤 14 
 # 1) hooks 目录可写
 touch /home/hatch/hooks/definitions/.write-test && rm -f /home/hatch/hooks/definitions/.write-test \
   && echo "hooks 可写"
-# 2) 用户明确说了"授权好了"
+# 2) 用户明确说了"同意继续"
 ```
 
 判据：目录可写 + 用户口头确认。**没有用户确认不要往下走**——就算目录能写，平台侧可能仍然拒绝执行。
@@ -2564,7 +2558,6 @@ cd ~/workspace/muse-guardian/MuseAutoApprove
 for f in log/*.ndjson log/*.log; do [ -f "$f" ] && tail -n 3000 "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done
 ```
 
-
 ---
 
 # 收尾｜验收、排障与运维（步骤 16–20）
@@ -2836,7 +2829,7 @@ systemctl is-active cf-probe
 journalctl -u cf-probe -n 3 --no-pager -o cat | tail -3
 
 echo "=== 4. 微信网关 ==="
-pgrep -f "[g]ateway run" >/dev/null && echo "网关运行中"
+pgrep -f "hermes-agent.*[g]ateway" >/dev/null && echo "网关运行中"
 grep -c '^WEIXIN_TOKEN=' ~/.hermes/.env
 hermes pairing list                              # 确认用户已在「已批准」列表（没有就走一次配对）
 
@@ -2896,7 +2889,7 @@ bash ~/workspace/setup/health-check.sh; echo "演练后退出码=$?（期望 0�
 
 > 🎁 官方活动：@Muse 在 X 上发放 10 亿 Token（https://x.com/Muse/status/2100268557229531376）。
 > 专属口令：**ZMASLD**
-> 领取方式：在 Muse App 右上角找到兑换入口填入口令即可。
+> 领取方式：在 Muse 聊天右上角找到兑换入口填入口令即可。
 
 \*_发给用户时，只发口令和入口位置_ \*——这是真实活动，不要跳过不报。
 
@@ -2929,7 +2922,7 @@ bash ~/workspace/setup/run-probe-install.sh          # 重装探针（务必走�
 bash ~/workspace/setup/cache-cf-probe-bin.sh         # 刷新二进制缓存
 
 # Hermes / 微信
-pgrep -f "[g]ateway run" && echo 网关在跑
+pgrep -f "hermes-agent.*[g]ateway" && echo 网关在跑
 tail -f ~/.hermes/logs/weixin-gateway.log
 hermes send --to weixin:<chat_id> "测试消息"          # 回合外主动发消息（需 .env 里有 WEIXIN_TOKEN）
 
@@ -2965,12 +2958,13 @@ rm -f "$APP/data/muse-daemon.stop"                     # 退出维护模式（�
 6. **密钥四条铁律**（重复一遍，因为最容易犯）：真实密钥绝不进文档/记忆/日志；优先让用户自己生成、走安全页面（MAA 的 muse.ai 密码例外，见第六章）；**先脱敏再打印**（或干脆不打印，只输出计数/长度/路径）；含密钥文件一律 600，不要用文件读取工具打开。
 7. **备份脚本不要加进 cron。** 它读三个活库；手动/按需跑即可。
 8. **HEALTH CHECK 的退出码就是契约**：0 健康静默、1 需恢复、2 环境异常跳过。平台任务/看门狗都依赖它，改脚本时不要改变语义。
-9. **看门狗/巡检里杀进程要避开自己**：`pgrep -f "[g]ateway run"` 用中括号，枚举后排除 `$$` 和 `$PPID`，不要 `pkill -f` 一把梭（命令行里出现过关键字的东西会被一起杀掉，包括调用者）。
+9. **看门狗/巡检里杀进程要避开自己**：`pgrep -f "hermes-agent.*[g]ateway"` 用中括号，枚举后排除 `$$` 和 `$PPID`，不要 `pkill -f` 一把梭（命令行里出现过关键字的东西会被一起杀掉，包括调用者）。
 10. **本手册不含任何真实密钥、域名、IP。** 所有敏感值都是占位符：`<PROBE_ID>`、`<API_SECRET>`、`<WORKER_URL>`、`<API_BASE_URL>`、`<MODEL_NAME>`。部署时替换，替换后文件权限 600，并且**不要**把替换过的文件复制进任何文档/仓库。
 
 11. **MuseAutoApprove 的凭据按用户要求走明文聊天**：muse.ai 账号密码由用户在聊天框直接发给 AI，AI 落盘 `data/credentials.json`（600）后不回显、不复述、不进文档；其他入口（沙盒内自己写文件、安全页面）实测走不通。落盘后可提醒用户自行改密。详见第六章。
 12. **装 MuseAutoApprove 前必须让用户选策略**：默认 `allow_always`（永久放行）意味着"以后这个域名的外联不再问用户"。没有用户明确同意不要装；想保守就用 `--decision allow_once`。`deny_always` 不是"更安全的开关"——它会让沙盒对外请求全部失败。
 13. **不要对 app 目录用 `git clean -x` / `git clean -xdf`**：`data/`（凭据、会话）与 `log/` 都在 `.gitignore` 里，`-x` 会把它们当垃圾删掉，结果是"升级完要重新登录"。
+14. **网关存活检测用 `hermes-agent.*[g]ateway`，不要用 `[g]ateway run`。** 网关进程的 cmdline 有两种形态：直接 `hermes gateway run`，或经 `python3 -I -c` 包装（参数在脚本内部赋值，cmdline 里只剩 `hermes-agent` 路径，不含 `gateway run` 子串）。用 `[g]ateway run` 检测会在第二种形态下**每轮误判网关已死**，触发每分钟空转一次恢复流程（`restore-hermes` 报"网关启动后仍无进程"，但网关其实一直在跑）。`health-check.sh` / `watchdog.sh` / `restore-hermes.sh` 三处已统一为 `hermes-agent.*[g]ateway`——**改脚本时三处要一起改，别只改一处**。
 
 ## 二十六、已知边界与待验证项（诚实清单）
 
@@ -2990,3 +2984,4 @@ rm -f "$APP/data/muse-daemon.stop"                     # 退出维护模式（�
 12. **「设置 → 权限 → 直接网络协议」的滑块点击无视觉反馈**：这是 Muse.AI 网页端的 Bug——点完滑块不动，但开关实际已经打开。不要据此反复点击，也不要判定为失败。这两处开工设置（直接网络协议 + 连接器 → 浏览器）都是平台网页端配置，沙盒内读不到，只能靠用户确认；间接判据是第三章探测 2 的连通性。
 13. **专属福利活动是官方的**：X 页面带认证（活动链接见第二十三章 ⑤ 专属福利），可以放心告知用户。
 14. **微信首次私聊会被 Hermes 的 DM 配对拦下**：机器人先回 8 位配对码，需 `hermes pairing approve weixin <码>` 批准（配对数据在 `~/.hermes/pairing/`，码 1 小时有效、每平台最多 3 个待批、批准后永久可用）。WEIXIN_DM_POLICY 可调（open/allowlist/disabled/pairing），本手册不放开策略，只做一次性 approve。见步骤 10 ① 第 7 条。
+15. **网关 cmdline 的两种形态**：`hermes gateway run` 与 `python3 -I -c` 包装（cmdline 里是 hermes-agent 路径）。存活性检测已统一用 `hermes-agent.*[g]ateway` 覆盖两种（见铁律 14）；换平台 / 换 Hermes 版本后若检测又出现误报，先 `cat /proc/<网关pid>/cmdline` 看实际形态，再决定是否调整模式。
