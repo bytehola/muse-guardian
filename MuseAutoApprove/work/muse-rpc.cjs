@@ -110,7 +110,7 @@ async function mintToken() {
   if (!res.ok) throw new Error(`token ${res.status}: ${txt.slice(0, 300)}`);
   const j = JSON.parse(txt);
   rollCookiesFromToken(res);
-  fs.writeFileSync(TOKEN_PATH, JSON.stringify({ mintedAt: Date.now(), body: JSON.parse(txt) && j }, null, 2));
+  fs.writeFileSync(TOKEN_PATH, JSON.stringify({ mintedAt: Date.now(), body: j }, null, 2));
   return j; // {token, notary_token?, ...}
 }
 

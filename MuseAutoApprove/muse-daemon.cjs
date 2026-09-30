@@ -32,9 +32,8 @@ const PIDF = paths.DAEMON_PID_PATH;
 const COOKIE_PATH = paths.COOKIE_PATH;
 const CONSOLE_LOG = paths.LOG_DIR + '/muse-console.log';
 const TOUCH_MS = 5 * 60 * 1000;
-const LOG_TRIM_MS  = 60 * 60 * 1000;     // 每小时检查一次日志体积
-const LOG_MAX_BYTES = 5 * 1024 * 1024;   // 单文件超过 5MB 触发裁剪
-const LOG_KEEP_LINES = 2000;             // 裁剪后保留末尾行数
+const LOG_TRIM_MS  = 60 * 60 * 1000;      // 每小时检查一次日志体积
+const LOG_MAX_BYTES = 10 * 1024 * 1024;   // 单文件超过 10MB 触发裁剪，裁剪后保留末尾 ≤ 10MB
 
 function log(obj, toAlog) {
   const line = JSON.stringify({ ts: Date.now(), ...obj });
@@ -43,14 +42,24 @@ function log(obj, toAlog) {
   console.log(line);
 }
 
-/* 日志裁剪：单文件超过 LOG_MAX_BYTES 时只保留末尾 LOG_KEEP_LINES 行（追加写入，mv 替换安全） */
+/* 日志裁剪：单文件超过 LOG_MAX_BYTES 时保留末尾若干整行、总量压回上限内（追加写入，mv 替换安全） */
 function trimLog(file) {
   try {
     const st = fs.statSync(file);
     if (st.size <= LOG_MAX_BYTES) return;
     const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-    fs.writeFileSync(file, lines.slice(-LOG_KEEP_LINES).join('\n') + '\n');
-    console.error(`[log-trim] ${file} 已裁剪（保留末 ${LOG_KEEP_LINES} 行）`);
+    // 从末尾向前累加，直到再加一行就超过上限为止（保证裁剪后 ≤ 10MB，而不是固定行数）
+    const kept = [];
+    let bytes = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const lineBytes = Buffer.byteLength(lines[i], 'utf8') + 1;
+      if (bytes + lineBytes > LOG_MAX_BYTES) break;
+      kept.push(lines[i]);
+      bytes += lineBytes;
+    }
+    kept.reverse();
+    fs.writeFileSync(file, kept.join('\n') + '\n');
+    console.error(`[log-trim] ${file} 已裁剪（保留末 ${kept.length} 行，约 ${Math.round(bytes / 1024 / 1024 * 10) / 10}MB）`);
   } catch {}
 }
 

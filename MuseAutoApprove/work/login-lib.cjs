@@ -82,7 +82,9 @@ async function buildBlob(password, pk, keyId, ts) {
   h[0] = 1; h[1] = keyId & 0xff; h[2] = seal.length & 0xff; h[3] = (seal.length >> 8) & 0xff;
   seal.copy(h, 4); tag.copy(h, 4 + seal.length); body.copy(h, 4 + seal.length + 16);
   return `#PWD_BROWSER:5:${ts}:${Buffer.from(h).toString('base64')}`;
-}async function login(opts = {}) {
+}
+
+async function login(opts = {}) {
   const cred = resolveCredentials(opts);
   const EMAIL = cred.email;
   const PASSWORD = cred.password;

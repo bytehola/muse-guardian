@@ -142,6 +142,7 @@ log/                     # 日志（不进版本库）
 - **登录自愈**：`cookies.json` 丢失/损坏、会话过期或失效 → 自动全链登录（发 1 封邮件，无需读码）→ 重连继续。日志中出现 `connect_retry ENOENT` 后紧跟 `auto_login_ok` 属正常自愈路径。
 - **网络自愈**：连接抖动自动重试；WebSocket 断开自动重连。
 - 日志：`log/daemon-log.ndjson`（守护）+ `log/auto-approve-log.ndjson`（决策记录）。
+- **日志上限**：守护进程每小时检查一次，任何日志文件超过 **10MB** 就裁到末尾 10MB（整行保留，不会截断半行）。沙盒内看门狗 `watchdog.sh` 每分钟也会对全部日志做同样裁剪。
 
 ## 后台常驻
 
