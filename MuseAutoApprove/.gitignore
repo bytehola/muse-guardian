@@ -6,6 +6,8 @@ data/token-last.json
 data/*.bak.*
 data/*.stop
 data/*.pid
+data/LOGIN_BLOCKED
+data/login-attempts.json
 
 # 日志
 log/

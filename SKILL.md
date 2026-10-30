@@ -2536,7 +2536,7 @@ exec "$RESTORE"
 > 1. **Layer 1**：`watchdog.sh`（每分钟 cron）追加巡检段；
 > 2. **Layer 3**：`restore-all.sh`（重建恢复）追加启动段——开机钩子 `init.sh` 执行的就是 restore-all，所以**不用改 init.sh**。
 >
-> 两段都幂等：进程在就不动手；`data/muse-daemon.stop` 存在就跳过（维护模式）。
+> 两段都幂等：进程在就不动手；`data/muse-daemon.stop` 存在就跳过（维护模式）；`data/LOGIN_BLOCKED` 存在就跳过（自动登录熔断，避免循环发验证码）。
 
 ### ① 🤖 AI 执行（命令）
 
@@ -2547,7 +2547,7 @@ exec "$RESTORE"
 # 策略：默认 A（永久允许）；用户选了 B 就把 --always --fallback-once 换成 --decision allow_once
 MUSE_APP="$HOME/workspace/muse-guardian/MuseAutoApprove"
 MUSE_DLOG="$MUSE_APP/log/daemon-log.ndjson"
-if [ -f "$MUSE_APP/muse-daemon.cjs" ] && [ ! -e "$MUSE_APP/data/muse-daemon.stop" ]; then
+if [ -f "$MUSE_APP/muse-daemon.cjs" ] && [ ! -e "$MUSE_APP/data/muse-daemon.stop" ] && [ ! -e "$MUSE_APP/data/LOGIN_BLOCKED" ]; then
   if pgrep -f "[m]use-daemon.cjs" >/dev/null 2>&1; then
     # 可选加固：进程在但日志 15 分钟没动 → 判卡死，杀掉让下一轮重启
     last_ts="$(tail -n 5 "$MUSE_DLOG" 2>/dev/null | grep -o '"ts":[0-9]*' | tail -1 | cut -d: -f2)"
@@ -2602,13 +2602,13 @@ if [ -f "$MUSE_APP/muse-daemon.cjs" ]; then
         (cd "$MUSE_APP" && npm install --no-audit --no-fund >>"$LOG" 2>&1) || log "WARN: npm install 失败"
       fi
     fi
-    if [ ! -e "$MUSE_APP/data/muse-daemon.stop" ] && ! pgrep -f "[m]use-daemon.cjs" >/dev/null 2>&1; then
+    if [ ! -e "$MUSE_APP/data/muse-daemon.stop" ] && [ ! -e "$MUSE_APP/data/LOGIN_BLOCKED" ] && ! pgrep -f "[m]use-daemon.cjs" >/dev/null 2>&1; then
       mkdir -p "$MUSE_APP/log"
       (cd "$MUSE_APP" && nohup node muse-daemon.cjs --loop 10000 --always --fallback-once >> log/muse-console.log 2>&1 &)
       sleep 3
       pgrep -f "[m]use-daemon.cjs" >/dev/null 2>&1 && log "MuseAutoApprove 已启动" || log "WARN: MuseAutoApprove 启动失败"
     else
-      log "MuseAutoApprove 已在运行或处于维护模式，跳过"
+      log "MuseAutoApprove 已在运行、处于维护模式或登录熔断，跳过"
     fi
   fi
 else
@@ -2622,12 +2622,13 @@ grep -q "3b. MuseAutoApprove" "$F" && echo "补丁已在" || echo "未打补丁�
 bash -n "$F" && echo "语法 OK"
 ```
 
-**保活语义（四条，都实测过或按 Linux 语义成立）**：
+**保活语义（前四条实测过或按 Linux 语义成立）**：
 
 1. 进程在 → 静默跳过。
 2. 进程不在 + 预检过 → 拉起，3 秒后确认，失败记日志。
 3. 维护模式（stop 标记）→ 跳过，**不会跟用户抢**。
 4. 进程在但日志 15 分钟没动 → 判卡死，TERM 让下一轮重启（可选加固，补丁 A 里已含）。
+5. 登录熔断（`data/LOGIN_BLOCKED`）→ 不拉起，和 stop 标记一样是文件在就跳过。人工确认账号正常后，删除该标记和 `data/login-attempts.json`。
 
 **注意**：restore-all 跑完最后会执行一次 watchdog，所以补丁 B 不用单独调 watchdog。开机钩子（init.sh）执行 restore-all，同理覆盖。
 

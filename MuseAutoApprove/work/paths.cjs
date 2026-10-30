@@ -4,7 +4,8 @@
  * 三个目录都位于项目根目录（本文件所在 work/ 的上一级）。
  *
  *   work/   代码模块（本文件、login-lib、muse-rpc、muse-noise、proxy、auto-approve）
- *   data/   持久化数据：凭据、会话 cookie、vmId 缓存、最近 token、pid / stop 控制文件
+ *   data/   持久化数据：凭据、会话 cookie、vmId 缓存、最近 token、pid / stop 控制文件、
+ *           登录熔断标记 LOGIN_BLOCKED 与 login-attempts.json（login-guard.cjs 写入）
  *   log/    日志：daemon-log.ndjson、auto-approve-log.ndjson
  *
  * data/ 与 log/ 在首次 require 本模块时自动创建（mkdir 幂等，已存在则什么都不做），

@@ -156,6 +156,27 @@ log/                     # 日志（不进版本库）
 - 写 `data/muse-daemon.stop` 文件（守护进程下轮自检时优雅退出）
 - 或结束 `data/muse-daemon.pid` 中记录的进程 / 直接 Ctrl+C（前台运行时）
 
+## 自动登录熔断（LOGIN_BLOCKED）
+
+自动登录每次都会发一封验证码邮件。为避免会话失效时无限重试把账号刷进风控，`work/login-guard.cjs` 会在以下情况熔断：
+
+- 窗口内自动登录超过上限（默认 6 小时 2 次）
+- 登录失败且像是验证码/限流/send-otp 被拒（429、`loginCodeSendFailed`、`try again` 等）
+- token 端点返回 `hatch_vm_auth_no_match`（重新登录无法修复）
+
+缺少凭据时仍以退出码 2 结束：不写标记，也不占用上面的次数（这条路径在发验证码之前就返回）。
+
+熔断时写入 `data/LOGIN_BLOCKED`（JSON，含原因与时间），守护以退出码 **75** 退出；标记存在时守护拒绝启动，保活脚本也应跳过拉起。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `MUSE_GUARD_MAX` | `2` | 窗口内允许的自动登录次数 |
+| `MUSE_GUARD_WINDOW_H` | `6` | 计数窗口（小时） |
+| `MUSE_GUARD_NOTIFY` | 空 | 熔断时执行一次的通知程序，参数为一行说明 |
+| `MUSE_GUARD_DATA` | `data/` | 标记与计数文件目录 |
+
+解除：先人工登录确认账号正常（或放入有效的 `data/cookies.json`），再执行 `rm data/LOGIN_BLOCKED data/login-attempts.json`。
+
 ## 故障排查
 
 | 现象 | 原因 / 解决 |
