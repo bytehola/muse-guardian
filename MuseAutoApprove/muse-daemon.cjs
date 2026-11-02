@@ -18,12 +18,18 @@
  *
  * 日志: log/daemon-log.ndjson + log/auto-approve-log.ndjson（decide 记录同格式）
  * 停止: 写 data/muse-daemon.stop 或 Ctrl+C
+ * 熔断: 自动登录撞验证码/限流/VM 鉴权失败时写 data/LOGIN_BLOCKED 并以 75 退出（见 work/login-guard.cjs），
+ *       标记存在时拒绝启动；人工处理后 rm data/LOGIN_BLOCKED data/login-attempts.json
  */
 const fs = require('fs');
 const paths = require('./work/paths.cjs');
 const { installProxy, PROXY } = require('./work/proxy.cjs');
 installProxy();
-const { login, resolveCredentials } = require('./work/login-lib.cjs');
+const { login: rawLogin, resolveCredentials } = require('./work/login-lib.cjs');
+const guard = require('./work/login-guard.cjs');
+const login = (o) => guard.guardedLogin(rawLogin, o, x => log(typeof x === 'object' ? x : { event: 'guard', msg: String(x) }));
+/* 熔断后以 BLOCK_EXIT 退出（systemd 可配 RestartPreventExitStatus=75），保活脚本也不会再拉起 */
+function blockedExit(e) { if (e && e.code === 'LOGIN_BLOCKED') { log({ event: 'login_blocked_exit', exit: guard.BLOCK_EXIT, marker: guard.MARKER, error: e.message }); process.exit(guard.BLOCK_EXIT); } }
 
 const DLOG = paths.DAEMON_LOG_PATH;
 const ALOG = paths.AUTO_APPROVE_LOG_PATH;
@@ -117,6 +123,8 @@ function buildDecideParams(id, opts) {
 /* 需要重新登录的错误判定：cookie 文件丢失 / 会话失效 / token 拒绝 */
 function needsLogin(e) {
   const s = String((e && e.message) || e);
+  // VM 绑定不匹配：重新登录（发 OTP）修不好，直接熔断
+  if (guard.isVmAuthNoMatch(e)) blockedExit(guard.tripBlock('vm_auth_no_match', s, x => log(x)));
   return /ENOENT|token (401|403)|unauthor|forbidden|invalid session/i.test(s);
 }
 
@@ -166,6 +174,7 @@ async function connectWithHeal(rpc) {
         } catch (e2) {
           log({ event: 'auto_login_error', error: e2.message, code: e2.code || null });
           if (e2.code === 'NO_CREDENTIALS') throw e2;
+          blockedExit(e2);
         }
       }
       await new Promise(r => setTimeout(r, 2000));
@@ -176,6 +185,7 @@ async function connectWithHeal(rpc) {
 
 (async () => {
   const opts = parseArgs(process.argv.slice(2));
+  if (!opts.check && guard.isBlocked()) { console.error('LOGIN_BLOCKED marker present (' + guard.MARKER + '): ' + JSON.stringify(guard.readMarker()) + '\nrefusing to start; after manual login: ' + guard.CLEAR_HINT); process.exit(guard.BLOCK_EXIT); }
 
   /* ---- 体检模式：只本地读，不出网，不写 pid ---- */
   if (opts.check) {
@@ -210,6 +220,7 @@ async function connectWithHeal(rpc) {
     } catch (e) {
       log({ event: 'smoke_error', error: e.message, code: e.code || null });
       if (e.code === 'NO_CREDENTIALS') { console.error('\n' + e.message + '\n'); process.exit(2); }
+      if (e.code === 'LOGIN_BLOCKED') { console.error('LOGIN_BLOCKED:', e.message); process.exit(guard.BLOCK_EXIT); }
       console.error('SMOKE FAIL:', e.message); process.exit(1);
     }
   }
@@ -280,7 +291,7 @@ async function connectWithHeal(rpc) {
             const r = await login({ log: m => log({ event: 'login', msg: m }) });
             log({ event: 'auto_login_ok', frlAccountId: r.frlAccountId, credentialSource: r.source });
             lastTouch = Date.now();
-          } catch (e2) { log({ event: 'auto_login_error', error: e2.message, code: e2.code || null }); }
+          } catch (e2) { log({ event: 'auto_login_error', error: e2.message, code: e2.code || null }); blockedExit(e2); }
         }
       }
     }
@@ -299,6 +310,7 @@ async function connectWithHeal(rpc) {
   process.exit(0);
 })().catch(e => {
   if (e && e.code === 'NO_CREDENTIALS') { console.error('\n' + e.message + '\n'); process.exit(2); }
+  if (e && e.code === 'LOGIN_BLOCKED') { console.error('LOGIN_BLOCKED:', e.message); process.exit(guard.BLOCK_EXIT); }
   console.error('DAEMON FATAL:', (e && e.message) || e);
   process.exit(1);
 });
